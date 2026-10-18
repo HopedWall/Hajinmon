@@ -1,0 +1,21 @@
+# Game data (copyrighted): never commit it
+*.iso
+*.xex
+*.xexp
+game/
+
+# Build output and local files
+build/
+doa4/out/
+external/
+CMakeUserPresets.json
+launcher/bin/
+launcher/obj/
+hajinmon_settings.json
+save_backups/
+__pycache__/
+*.raw
+
+# Recompiled code: derived from the game's executable, so it is generated
+# locally from your own default.xex by the build (tools\build_doa4.cmd)
+doa4/generated/default/

@@ -1,0 +1,1096 @@
+diff --git a/include/rex/graphics/graphics_system.h b/include/rex/graphics/graphics_system.h
+index ac6b056..71d2d27 100644
+--- a/include/rex/graphics/graphics_system.h
++++ b/include/rex/graphics/graphics_system.h
+@@ -118,6 +118,11 @@ class GraphicsSystem : public system::IGraphicsSystem {
+   uint32_t interrupt_callback_ = 0;
+   uint32_t interrupt_callback_data_ = 0;
+ 
++  // Guest tick of the last vblank and frame duration, used to emulate
++  // D1MODE_V_COUNTER as a real scanline counter that moves during the frame.
++  std::atomic<uint64_t> last_vblank_tick_{0};
++  std::atomic<uint64_t> vblank_interval_ticks_{0};
++
+   std::atomic<bool> vsync_worker_running_;
+   system::object_ref<system::XHostThread> vsync_worker_thread_;
+ 
+diff --git a/include/rex/net/socket.h b/include/rex/net/socket.h
+index f107c8a..8bd434b 100644
+--- a/include/rex/net/socket.h
++++ b/include/rex/net/socket.h
+@@ -13,5 +13,8 @@ constexpr SocketHandle kInvalidSocket = -1;
+ 
+ int socket_close(SocketHandle handle);
+ int socket_ioctl(SocketHandle handle, uint32_t cmd, uint8_t* arg);
++// Error of the last failed socket call on this thread, as a Winsock error code
++// (what guests expect from WSAGetLastError).
++uint32_t socket_last_error();
+ 
+ }  // namespace rex::net
+diff --git a/src/core/socket_posix.cpp b/src/core/socket_posix.cpp
+index b4b885a..8211b37 100644
+--- a/src/core/socket_posix.cpp
++++ b/src/core/socket_posix.cpp
+@@ -3,17 +3,104 @@
+ 
+ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
+ 
++#include <errno.h>
++#include <fcntl.h>
+ #include <sys/ioctl.h>
+ #include <unistd.h>
+ 
++#include <cstring>
++
+ namespace rex::net {
+ 
++namespace {
++
++// Winsock ioctlsocket commands used by guests (same values on the Xbox 360).
++constexpr uint32_t kWinsockFionbio = 0x8004667E;
++constexpr uint32_t kWinsockFionread = 0x4004667F;
++
++}  // namespace
++
+ int socket_close(SocketHandle handle) {
+   return close(static_cast<int>(handle));
+ }
+ 
++// Translates the Winsock commands to POSIX: the command values differ, so passing
++// them to ioctl unchanged fails and, for FIONBIO, leaves the socket blocking.
++// The argument is a 32-bit value used like ioctlsocket's u_long on Windows.
+ int socket_ioctl(SocketHandle handle, uint32_t cmd, uint8_t* arg) {
+-  return ioctl(static_cast<int>(handle), cmd, arg);
++  int fd = static_cast<int>(handle);
++  switch (cmd) {
++    case kWinsockFionbio: {
++      uint32_t enable;
++      std::memcpy(&enable, arg, sizeof(enable));
++      int flags = fcntl(fd, F_GETFL, 0);
++      if (flags < 0) {
++        return -1;
++      }
++      flags = enable ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
++      return fcntl(fd, F_SETFL, flags) < 0 ? -1 : 0;
++    }
++    case kWinsockFionread: {
++      int available = 0;
++      if (ioctl(fd, FIONREAD, &available) < 0) {
++        return -1;
++      }
++      uint32_t value = uint32_t(available);
++      std::memcpy(arg, &value, sizeof(value));
++      return 0;
++    }
++    default:
++      return ioctl(fd, cmd, arg);
++  }
++}
++
++uint32_t socket_last_error() {
++  switch (errno) {
++    case EAGAIN:
++#if EWOULDBLOCK != EAGAIN
++    case EWOULDBLOCK:
++#endif
++      return 10035;  // WSAEWOULDBLOCK
++    case EINPROGRESS:
++      return 10036;  // WSAEINPROGRESS
++    case EALREADY:
++      return 10037;  // WSAEALREADY
++    case EBADF:
++    case ENOTSOCK:
++      return 10038;  // WSAENOTSOCK
++    case EMSGSIZE:
++      return 10040;  // WSAEMSGSIZE
++    case EADDRINUSE:
++      return 10048;  // WSAEADDRINUSE
++    case EADDRNOTAVAIL:
++      return 10049;  // WSAEADDRNOTAVAIL
++    case ENETDOWN:
++      return 10050;  // WSAENETDOWN
++    case ENETUNREACH:
++      return 10051;  // WSAENETUNREACH
++    case ECONNABORTED:
++      return 10053;  // WSAECONNABORTED
++    case ECONNRESET:
++      return 10054;  // WSAECONNRESET
++    case ENOTCONN:
++      return 10057;  // WSAENOTCONN
++    case ETIMEDOUT:
++      return 10060;  // WSAETIMEDOUT
++    case ECONNREFUSED:
++      return 10061;  // WSAECONNREFUSED
++    case EHOSTUNREACH:
++      return 10065;  // WSAEHOSTUNREACH
++    case EINTR:
++      return 10004;  // WSAEINTR
++    case EACCES:
++      return 10013;  // WSAEACCES
++    case EFAULT:
++      return 10014;  // WSAEFAULT
++    case EINVAL:
++      return 10022;  // WSAEINVAL
++    default:
++      return 10022;  // WSAEINVAL
++  }
+ }
+ 
+ }  // namespace rex::net
+diff --git a/src/core/socket_win.cpp b/src/core/socket_win.cpp
+index 87f1960..02428da 100644
+--- a/src/core/socket_win.cpp
++++ b/src/core/socket_win.cpp
+@@ -17,4 +17,8 @@ int socket_ioctl(SocketHandle handle, uint32_t cmd, uint8_t* arg) {
+   return ioctlsocket(static_cast<SOCKET>(handle), cmd, reinterpret_cast<u_long*>(arg));
+ }
+ 
++uint32_t socket_last_error() {
++  return uint32_t(WSAGetLastError());
++}
++
+ }  // namespace rex::net
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 9ac8d15..a43d140 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -414,9 +414,11 @@ class PosixConditionBase {
+       if (timeout == std::chrono::milliseconds::max()) {
+         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+       } else {
+-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
+-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
+-        std::this_thread::sleep_for(sleep_time);
++        // Not truncated to whole milliseconds: with less than 1 ms left that gave
++        // sleep_for(0), and the thread spun at 100% until the deadline.
++        std::chrono::steady_clock::duration remaining = end_time - now;
++        std::this_thread::sleep_for(
++            std::min<std::chrono::steady_clock::duration>(remaining, std::chrono::milliseconds(1)));
+       }
+     }
+   }
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index a744375..98058d6 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -10,6 +10,8 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
++#include <chrono>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+@@ -37,6 +39,9 @@
+ 
+ REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+ 
++REXCVAR_DEFINE_BOOL(log_guest_fps, false, "GPU",
++                    "Log the guest frame rate (swaps per second) every 5 seconds");
++
+ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
+                     "Refresh page-valid state from GPU-written memory at frame end. "
+                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
+@@ -619,7 +624,32 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
+   reader.set_read_offset(read_index * sizeof(uint32_t));
+   reader.set_write_offset(write_index * sizeof(uint32_t));
++  const uint32_t ring_dwords = primary_buffer_size_ / sizeof(uint32_t);
+   do {
++    // Like the real command processor, advance the read pointer as packets are
++    // fetched, not only once the whole [read, write) block has been executed,
++    // so games waiting for the GPU to pass a position in the middle of a block
++    // see it progress.
++    if (read_ptr_writeback_ptr_ && ring_dwords) {
++      memory::RingBuffer peek = reader;
++      uint32_t header = peek.ReadAndSwap<uint32_t>();
++      uint32_t size_dwords = 1;
++      switch (header >> 30) {
++        case 0:
++        case 3:
++          size_dwords += ((header >> 16) & 0x3FFF) + 1;
++          break;
++        case 1:
++          size_dwords += 2;
++          break;
++        default:
++          break;
++      }
++      uint32_t next_index =
++          (uint32_t(reader.read_offset() / sizeof(uint32_t)) + size_dwords) % ring_dwords;
++      memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
++                                       next_index);
++    }
+     if (!ExecutePacket(&reader)) {
+       // This probably should be fatal - but we're going to continue anyways.
+       REXGPU_ERROR("**** PRIMARY RINGBUFFER: Failed to execute packet.");
+@@ -960,6 +990,19 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+ 
+   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+ 
++  if (REXCVAR_GET(log_guest_fps)) {
++    static auto fps_window_start = std::chrono::steady_clock::now();
++    static uint32_t fps_window_swaps = 0;
++    ++fps_window_swaps;
++    auto now = std::chrono::steady_clock::now();
++    double seconds = std::chrono::duration<double>(now - fps_window_start).count();
++    if (seconds >= 5.0) {
++      REXGPU_INFO("Guest frame rate: {:.1f} FPS", fps_window_swaps / seconds);
++      fps_window_start = now;
++      fps_window_swaps = 0;
++    }
++  }
++
+   ++counter_;
+   return true;
+ }
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 19874a5..61c6e75 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -3910,6 +3910,14 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
+         dirty |= system_constants_.edram_rt_blend_factors_ops[i] != blend_factors_ops;
+         system_constants_.edram_rt_blend_factors_ops[i] = blend_factors_ops;
+       }
++    } else {
++      // Host render targets: the pixel shader applies the source factor of
++      // min/max blending itself (Xenos applies the factors to min/max, Direct3D
++      // 12 doesn't), so it needs the blend control too.
++      uint32_t blend_factors_ops =
++          regs[reg::RB_BLENDCONTROL::rt_register_indices[i]] & 0x1FFF1FFF;
++      dirty |= system_constants_.edram_rt_blend_factors_ops[i] != blend_factors_ops;
++      system_constants_.edram_rt_blend_factors_ops[i] = blend_factors_ops;
+     }
+   }
+ 
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 8f2fcb0..90266f0 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -12,6 +12,7 @@
+ #include <rex/graphics/graphics_system.h>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cctype>
+ #include <cstdint>
+ #include <functional>
+@@ -162,6 +163,7 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+           uint64_t interval_ticks =
+               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
++          vblank_interval_ticks_ = interval_ticks;
+           while (current_time - last_frame_time >= interval_ticks) {
+             MarkVblank();
+             last_frame_time += interval_ticks;
+@@ -240,7 +242,20 @@ uint32_t GraphicsSystem::ReadRegister(uint32_t addr) {
+     case 0x194C: {  // R500_D1MODE_V_COUNTER
+       system::X_VIDEO_MODE video_mode;
+       kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
+-      return std::min(uint32_t(video_mode.display_height), uint32_t(0x0FFF));
++      uint32_t height = std::min(uint32_t(video_mode.display_height), uint32_t(0x0FFF));
++      // The current scanline moves from 0 (right after the vblank) to the
++      // screen height during a frame. A fixed value makes games believe the
++      // beam is always at the bottom: games that synchronize presentation with
++      // the beam position (e.g. Dead or Alive 4, D3D callback 0x82746B48)
++      // would then wait forever.
++      uint64_t interval = vblank_interval_ticks_.load();
++      uint64_t last = last_vblank_tick_.load();
++      if (!interval || !last) {
++        return height;
++      }
++      uint64_t elapsed = chrono::Clock::QueryGuestTickCount() - last;
++      uint32_t line = uint32_t(std::min<uint64_t>(elapsed * height / interval, height));
++      return line;
+     }
+     case 0x1951:    // interrupt status
+       return 1;     // vblank
+@@ -325,6 +340,9 @@ void GraphicsSystem::MarkVblank() {
+     command_processor_->increment_counter();
+   }
+ 
++  // The beam restarts from the top: D1MODE_V_COUNTER is computed from here.
++  last_vblank_tick_ = chrono::Clock::QueryGuestTickCount();
++
+   // TODO(benvanik): we shouldn't need to do the dispatch here, but there's
+   //     something wrong and the CP will block waiting for code that
+   //     needs to be run in the interrupt.
+diff --git a/src/graphics/pipeline/shader/dxbc_translator_om.cpp b/src/graphics/pipeline/shader/dxbc_translator_om.cpp
+index a7d508a..2218b4c 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator_om.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator_om.cpp
+@@ -1548,6 +1548,51 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs() {
+              LoadSystemConstant(SystemConstants::Index::kColorExpBias,
+                                 offsetof(SystemConstants, color_exp_bias) + sizeof(float) * i,
+                                 dxbc::Src::kXXXX));
++    // Xenos applies the blend factors to min/max blending, but Direct3D 12
++    // ignores them. Apply the source color factor here (the factors that only
++    // depend on the source), so max(src * src_factor, dest) matches Xenos when
++    // the destination factor is one - Dead or Alive 4 draws its PRESS START
++    // sprite with max(src * src_alpha, dest) over a transparent white
++    // background, which is an opaque white box otherwise.
++    {
++      dxbc::Src blend_factors_ops_src(LoadSystemConstant(
++          SystemConstants::Index::kEdramRTBlendFactorsOps,
++          offsetof(SystemConstants, edram_rt_blend_factors_ops) + sizeof(uint32_t) * i,
++          dxbc::Src::kXXXX));
++      dxbc::Dest color_rgb_dest(dxbc::Dest::R(system_temp_color, 0b0111));
++      dxbc::Src color_src(dxbc::Src::R(system_temp_color));
++      dxbc::Src color_alpha_src(dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW));
++      dxbc::Dest scratch_x_dest(dxbc::Dest::R(gamma_temp, 0b0001));
++      dxbc::Src scratch_x_src(dxbc::Src::R(gamma_temp, dxbc::Src::kXXXX));
++      // gamma_temp.x = whether min/max is used for the color.
++      a_.OpAnd(scratch_x_dest, blend_factors_ops_src, dxbc::Src::LU(1 << (5 + 1)));
++      a_.OpIf(true, scratch_x_src);
++      {
++        // gamma_temp.x = source color factor.
++        a_.OpAnd(scratch_x_dest, blend_factors_ops_src, dxbc::Src::LU((1 << 5) - 1));
++        a_.OpSwitch(scratch_x_src);
++        a_.OpCase(dxbc::Src::LU(uint32_t(xenos::BlendFactor::kZero)));
++        a_.OpMov(color_rgb_dest, dxbc::Src::LF(0.0f));
++        a_.OpBreak();
++        a_.OpCase(dxbc::Src::LU(uint32_t(xenos::BlendFactor::kSrcColor)));
++        a_.OpMul(color_rgb_dest, color_src, color_src);
++        a_.OpBreak();
++        a_.OpCase(dxbc::Src::LU(uint32_t(xenos::BlendFactor::kOneMinusSrcColor)));
++        a_.OpMAd(color_rgb_dest, -color_src, color_src, color_src);
++        a_.OpBreak();
++        a_.OpCase(dxbc::Src::LU(uint32_t(xenos::BlendFactor::kSrcAlpha)));
++        a_.OpMul(color_rgb_dest, color_src, color_alpha_src);
++        a_.OpBreak();
++        a_.OpCase(dxbc::Src::LU(uint32_t(xenos::BlendFactor::kOneMinusSrcAlpha)));
++        a_.OpMAd(color_rgb_dest, -color_src, color_alpha_src, color_src);
++        a_.OpBreak();
++        // The other factors depend on the destination or are one.
++        a_.OpDefault();
++        a_.OpBreak();
++        a_.OpEndSwitch();
++      }
++      a_.OpEndIf();
++    }
+     if (gamma_render_target_as_unorm8_) {
+       // Convert to gamma space - this is incorrect, since it must be done after
+       // blending on the Xbox 360, but this is just one of many blending issues
+@@ -2305,6 +2350,38 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
+           // Need to do min/max for color.
+           a_.OpElse();
+           {
++            // Unlike Direct3D and Vulkan on the PC, Xenos applies the blend
++            // factors to the source and the destination before min/max: Dead or
++            // Alive 4 draws its PRESS START sprite with max(src * src_alpha,
++            // dst * 1) over a transparent white background, which would
++            // otherwise be drawn as an opaque white box.
++            uint32_t min_max_src_temp = PushSystemTemp();
++            uint32_t min_max_factor_temp = PushSystemTemp();
++            dxbc::Dest min_max_src_rgb_dest(dxbc::Dest::R(min_max_src_temp, 0b0111));
++            dxbc::Src min_max_src_src(dxbc::Src::R(min_max_src_temp));
++            dxbc::Dest min_max_factor_rgb_dest(dxbc::Dest::R(min_max_factor_temp, 0b0111));
++            dxbc::Src min_max_factor_src(dxbc::Src::R(min_max_factor_temp));
++            // Source part (kZero has no case and stays 0).
++            // min_max_src_temp.xyz = source color * source color factor.
++            a_.OpMov(min_max_factor_rgb_dest, dxbc::Src::LF(0.0f));
++            a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU((1 << 5) - 1));
++            a_.OpSwitch(temp_x_src);
++            ROV_HandleColorBlendFactorCases(system_temps_color_[i], color_temp,
++                                            min_max_factor_temp);
++            a_.OpEndSwitch();
++            a_.OpMul(min_max_src_rgb_dest, dxbc::Src::R(system_temps_color_[i]),
++                     min_max_factor_src);
++            // Destination part, computed before color_temp is overwritten.
++            // color_temp.xyz = destination color * destination color factor.
++            a_.OpMov(min_max_factor_rgb_dest, dxbc::Src::LF(0.0f));
++            a_.OpUBFE(temp_x_dest, dxbc::Src::LU(5), dxbc::Src::LU(8), rt_blend_factors_ops_src);
++            a_.OpSwitch(temp_x_src);
++            ROV_HandleColorBlendFactorCases(system_temps_color_[i], color_temp,
++                                            min_max_factor_temp);
++            a_.OpEndSwitch();
++            a_.OpMul(color_temp_rgb_dest, color_temp_src, min_max_factor_src);
++            // Release min_max_factor_temp.
++            PopSystemTemp();
+             // Extract the color min (0) or max (1) bit to temp.x
+             // temp.x = whether min or max should be used for color.
+             a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << 5));
+@@ -2312,21 +2389,21 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
+             // temp.x = free.
+             a_.OpIf(true, temp_x_src);
+             {
+-              // Choose max of the colors without applying the factors to
+-              // color_temp.xyz.
++              // Choose max of the weighted colors to color_temp.xyz.
+               // color_temp.xyz = blended color.
+-              a_.OpMax(color_temp_rgb_dest, dxbc::Src::R(system_temps_color_[i]), color_temp_src);
++              a_.OpMax(color_temp_rgb_dest, min_max_src_src, color_temp_src);
+             }
+             // Need to do min.
+             a_.OpElse();
+             {
+-              // Choose min of the colors without applying the factors to
+-              // color_temp.xyz.
++              // Choose min of the weighted colors to color_temp.xyz.
+               // color_temp.xyz = blended color.
+-              a_.OpMin(color_temp_rgb_dest, dxbc::Src::R(system_temps_color_[i]), color_temp_src);
++              a_.OpMin(color_temp_rgb_dest, min_max_src_src, color_temp_src);
+             }
+             // Close the min or max check.
+             a_.OpEndIf();
++            // Release min_max_src_temp.
++            PopSystemTemp();
+           }
+           // Close the color factor blending or min/max check.
+           a_.OpEndIf();
+diff --git a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+index 9ce3bb4..9d5777f 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+@@ -2030,10 +2030,24 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+         }
+ 
+         // Apply the exponent bias from the bits 13:18 of the fetch constant
+-        // word 4.
++        // word 3 (exp_adjust). Word 4 has the LOD bias at these bits, which
++        // made the result scale random - for instance 2^-24, all textures
++        // black in Dead or Alive 4. The DXBC translator reads word 3 too.
++        id_vector_temp_.clear();
++        id_vector_temp_.push_back(const_int_0_);
++        id_vector_temp_.push_back(
++            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) >> 2)));
++        id_vector_temp_.push_back(
++            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) & 3)));
++        spv::Id fetch_constant_word_3_signed = builder_->createUnaryOp(
++            spv::OpBitcast, type_int_,
++            builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
++                                                             uniform_fetch_constants_,
++                                                             id_vector_temp_),
++                                 spv::NoPrecision));
+         spv::Id result_exponent_bias = builder_->createBinBuiltinCall(
+             type_float_, ext_inst_glsl_std_450_, GLSLstd450Ldexp, const_float_1_,
+-            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_4_signed,
++            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_3_signed,
+                                   builder_->makeUintConstant(13), builder_->makeUintConstant(6)));
+         {
+           uint32_t result_remaining_components = used_result_nonzero_components;
+diff --git a/src/graphics/pipeline/shader/spirv_translator_rb.cpp b/src/graphics/pipeline/shader/spirv_translator_rb.cpp
+index 765c141..d8772f8 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_rb.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_rb.cpp
+@@ -1324,18 +1324,80 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
+         if_rt_write_mask_not_empty.makeEndIf();
+         if_fsi_color_written.makeEndIf();
+       } else {
+-        // Convert to gamma space - this is incorrect, since it must be done
+-        // after blending on the Xbox 360, but this is just one of many blending
+-        // issues in the host render target path.
+-        // Keep parity with D3D12: use explicit Xenos PWL gamma conversion in
+-        // shader code for gamma render targets in this path, rather than host
+-        // sRGB attachment conversion behavior.
+         uint_vector_temp_.clear();
+         uint_vector_temp_.push_back(0);
+         uint_vector_temp_.push_back(1);
+         uint_vector_temp_.push_back(2);
+         spv::Id color_rgb =
+             builder_->createRvalueSwizzle(spv::NoPrecision, type_float3_, color, uint_vector_temp_);
++
++        // Xenos applies the blend factors to min/max blending, but Vulkan
++        // ignores them. Apply the source color factor here (the factors that
++        // only depend on the source), so max(src * src_factor, dest) matches
++        // Xenos when the destination factor is one - Dead or Alive 4 draws its
++        // PRESS START sprite with max(src * src_alpha, dest) over a transparent
++        // white background, which is an opaque white box otherwise. Same as the
++        // DXBC translator's host render target path.
++        {
++          id_vector_temp_.clear();
++          id_vector_temp_.push_back(
++              builder_->makeIntConstant(kSystemConstantEdramRTBlendFactorsOps));
++          id_vector_temp_.push_back(builder_->makeIntConstant(int32_t(color_target_index)));
++          spv::Id blend_factors_ops = builder_->createLoad(
++              builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
++                                          id_vector_temp_),
++              spv::NoPrecision);
++          // Min (2) or max (3) color combine function: bit 1 of bits 5:7.
++          spv::Id is_min_max = builder_->createBinOp(
++              spv::OpINotEqual, type_bool_,
++              builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, blend_factors_ops,
++                                    builder_->makeUintConstant(UINT32_C(1) << (5 + 1))),
++              const_uint_0_);
++          spv::Id src_factor =
++              builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, blend_factors_ops,
++                                    builder_->makeUintConstant((UINT32_C(1) << 5) - 1));
++          spv::Id color_alpha = builder_->createCompositeExtract(color, type_float_, 3);
++          spv::Id color_alpha3 = builder_->smearScalar(spv::NoPrecision, color_alpha, type_float3_);
++          auto bool3 = [&](spv::Id condition) {
++            return builder_->smearScalar(spv::NoPrecision, condition, type_bool3_);
++          };
++          auto factor_is = [&](xenos::BlendFactor factor) {
++            return bool3(builder_->createBinOp(spv::OpIEqual, type_bool_, src_factor,
++                                               builder_->makeUintConstant(uint32_t(factor))));
++          };
++          // The factors that depend on the destination or are one keep 1.
++          spv::Id factor = const_float3_1_;
++          factor = builder_->createTriOp(spv::OpSelect, type_float3_,
++                                         factor_is(xenos::BlendFactor::kZero), const_float3_0_,
++                                         factor);
++          factor = builder_->createTriOp(spv::OpSelect, type_float3_,
++                                         factor_is(xenos::BlendFactor::kSrcColor), color_rgb,
++                                         factor);
++          factor = builder_->createTriOp(
++              spv::OpSelect, type_float3_, factor_is(xenos::BlendFactor::kOneMinusSrcColor),
++              builder_->createNoContractionBinOp(spv::OpFSub, type_float3_, const_float3_1_,
++                                                 color_rgb),
++              factor);
++          factor = builder_->createTriOp(spv::OpSelect, type_float3_,
++                                         factor_is(xenos::BlendFactor::kSrcAlpha), color_alpha3,
++                                         factor);
++          factor = builder_->createTriOp(
++              spv::OpSelect, type_float3_, factor_is(xenos::BlendFactor::kOneMinusSrcAlpha),
++              builder_->createNoContractionBinOp(spv::OpFSub, type_float3_, const_float3_1_,
++                                                 color_alpha3),
++              factor);
++          color_rgb = builder_->createTriOp(
++              spv::OpSelect, type_float3_, bool3(is_min_max),
++              builder_->createNoContractionBinOp(spv::OpFMul, type_float3_, color_rgb, factor),
++              color_rgb);
++        }
++
++        // Convert to gamma space - this is incorrect, since it must be done
++        // after blending on the Xbox 360, but this is just one of many blending
++        // issues in the host render target path.
++        // Keep parity with D3D12: use explicit Xenos PWL gamma conversion in
++        // shader code for gamma render targets in this path, rather than host
++        // sRGB attachment conversion behavior.
+         spv::Id is_gamma = builder_->createBinOp(
+             spv::OpINotEqual, type_bool_,
+             builder_->createBinOp(
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 001f36b..b835f41 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -4166,8 +4166,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
+   }
+ 
+-  if (IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport)) &&
+-      !memexport_ranges_.empty()) {
++  // Check the ranges first: IsReadbackMemexportEnabled looks up a cvar by name.
++  if (!memexport_ranges_.empty() &&
++      IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport))) {
+     uint32_t memexport_total_size = 0;
+     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+       memexport_total_size += memexport_range.size_bytes;
+@@ -6269,6 +6270,14 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
+             std::memcmp(system_constants_.edram_rt_clamp[i], rt_clamp[i], 4 * sizeof(float)) != 0;
+         std::memcpy(system_constants_.edram_rt_clamp[i], rt_clamp[i], 4 * sizeof(float));
+       }
++    } else {
++      // Host render targets: the fragment shader applies the source factor of
++      // min/max blending itself (Xenos applies the factors to min/max, Vulkan
++      // doesn't), so it needs the blend control too.
++      uint32_t blend_factors_ops =
++          regs[reg::RB_BLENDCONTROL::rt_register_indices[i]] & 0x1FFF1FFF;
++      dirty |= system_constants_.edram_rt_blend_factors_ops[i] != blend_factors_ops;
++      system_constants_.edram_rt_blend_factors_ops[i] = blend_factors_ops;
+     }
+   }
+ 
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index ecbd940..cdef05f 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -3218,6 +3218,10 @@ void VulkanTextureCache::GetTextureUsageMasks(VulkanTexture::Usage usage,
+   layout = VK_IMAGE_LAYOUT_UNDEFINED;
+   switch (usage) {
+     case VulkanTexture::Usage::kUndefined:
++      // For the UNDEFINED layout (a newly created texture), use TOP_OF_PIPE as
++      // the source stage (wait for nothing, discard the old contents) - a
++      // source stage mask of 0 is invalid in Vulkan.
++      stage_mask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+       break;
+     case VulkanTexture::Usage::kTransferDestination:
+       stage_mask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index 813bb1c..9ccee36 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -11,6 +11,9 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <iterator>
++#include <string>
++#include <string_view>
+ 
+ #include <rex/dbg.h>
+ #include <rex/input/device_assignment.h>
+@@ -28,6 +31,39 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
+     .allowed({"sdl", "xinput"});
+ 
+ REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
++
++// Controller remapping: each option names the physical control(s) that act as
++// that guest control, as a comma-separated list of A, B, X, Y, LB, RB, LT, RT,
++// Back, Start, LS, RS, DpadUp, DpadDown, DpadLeft, DpadRight ("" = unbound).
++REXCVAR_DEFINE_STRING(padbind_a, "A", "Input/Keybinds/Gamepad", "Pad control(s) for the A button");
++REXCVAR_DEFINE_STRING(padbind_b, "B", "Input/Keybinds/Gamepad", "Pad control(s) for the B button");
++REXCVAR_DEFINE_STRING(padbind_x, "X", "Input/Keybinds/Gamepad", "Pad control(s) for the X button");
++REXCVAR_DEFINE_STRING(padbind_y, "Y", "Input/Keybinds/Gamepad", "Pad control(s) for the Y button");
++REXCVAR_DEFINE_STRING(padbind_left_shoulder, "LB", "Input/Keybinds/Gamepad",
++                      "Pad control(s) for the left shoulder");
++REXCVAR_DEFINE_STRING(padbind_right_shoulder, "RB", "Input/Keybinds/Gamepad",
++                      "Pad control(s) for the right shoulder");
++REXCVAR_DEFINE_STRING(padbind_left_trigger, "LT", "Input/Keybinds/Gamepad",
++                      "Pad control(s) for the left trigger");
++REXCVAR_DEFINE_STRING(padbind_right_trigger, "RT", "Input/Keybinds/Gamepad",
++                      "Pad control(s) for the right trigger");
++REXCVAR_DEFINE_STRING(padbind_back, "Back", "Input/Keybinds/Gamepad",
++                      "Pad control(s) for the Back button");
++REXCVAR_DEFINE_STRING(padbind_start, "Start", "Input/Keybinds/Gamepad",
++                      "Pad control(s) for the Start button");
++REXCVAR_DEFINE_STRING(padbind_lstick_press, "LS", "Input/Keybinds/Gamepad",
++                      "Pad control(s) for the left stick press");
++REXCVAR_DEFINE_STRING(padbind_rstick_press, "RS", "Input/Keybinds/Gamepad",
++                      "Pad control(s) for the right stick press");
++REXCVAR_DEFINE_STRING(padbind_dpad_up, "DpadUp", "Input/Keybinds/Gamepad",
++                      "Pad control(s) for D-pad up");
++REXCVAR_DEFINE_STRING(padbind_dpad_down, "DpadDown", "Input/Keybinds/Gamepad",
++                      "Pad control(s) for D-pad down");
++REXCVAR_DEFINE_STRING(padbind_dpad_left, "DpadLeft", "Input/Keybinds/Gamepad",
++                      "Pad control(s) for D-pad left");
++REXCVAR_DEFINE_STRING(padbind_dpad_right, "DpadRight", "Input/Keybinds/Gamepad",
++                      "Pad control(s) for D-pad right");
++
+ namespace rex::input {
+ 
+ namespace {
+@@ -37,6 +73,117 @@ namespace {
+ // flag and never reads this value.
+ constexpr uint32_t kSyntheticOrdinal = UINT32_MAX;
+ 
++enum class PadTrigger { kNone, kLeft, kRight };
++
++struct PadControl {
++  const char* name;
++  uint16_t button;
++  PadTrigger trigger;
++};
++
++constexpr PadControl kPadControls[] = {
++    {"A", X_INPUT_GAMEPAD_A, PadTrigger::kNone},
++    {"B", X_INPUT_GAMEPAD_B, PadTrigger::kNone},
++    {"X", X_INPUT_GAMEPAD_X, PadTrigger::kNone},
++    {"Y", X_INPUT_GAMEPAD_Y, PadTrigger::kNone},
++    {"LB", X_INPUT_GAMEPAD_LEFT_SHOULDER, PadTrigger::kNone},
++    {"RB", X_INPUT_GAMEPAD_RIGHT_SHOULDER, PadTrigger::kNone},
++    {"LT", 0, PadTrigger::kLeft},
++    {"RT", 0, PadTrigger::kRight},
++    {"Back", X_INPUT_GAMEPAD_BACK, PadTrigger::kNone},
++    {"Start", X_INPUT_GAMEPAD_START, PadTrigger::kNone},
++    {"LS", X_INPUT_GAMEPAD_LEFT_THUMB, PadTrigger::kNone},
++    {"RS", X_INPUT_GAMEPAD_RIGHT_THUMB, PadTrigger::kNone},
++    {"DpadUp", X_INPUT_GAMEPAD_DPAD_UP, PadTrigger::kNone},
++    {"DpadDown", X_INPUT_GAMEPAD_DPAD_DOWN, PadTrigger::kNone},
++    {"DpadLeft", X_INPUT_GAMEPAD_DPAD_LEFT, PadTrigger::kNone},
++    {"DpadRight", X_INPUT_GAMEPAD_DPAD_RIGHT, PadTrigger::kNone},
++};
++
++const PadControl* FindPadControl(std::string_view name) {
++  for (const auto& control : kPadControls) {
++    if (name == control.name) {
++      return &control;
++    }
++  }
++  return nullptr;
++}
++
++// How far the physical control is pressed, 0-255 (buttons are 0 or 255).
++uint8_t PadControlValue(const X_INPUT_GAMEPAD& pad, const PadControl& control) {
++  switch (control.trigger) {
++    case PadTrigger::kLeft:
++      return pad.left_trigger;
++    case PadTrigger::kRight:
++      return pad.right_trigger;
++    default:
++      return (static_cast<uint16_t>(pad.buttons) & control.button) ? 0xFF : 0;
++  }
++}
++
++// The strongest of the physical controls listed in 'binds'.
++uint8_t PadBindValue(const X_INPUT_GAMEPAD& pad, std::string_view binds) {
++  uint8_t value = 0;
++  while (!binds.empty()) {
++    size_t comma = binds.find(',');
++    std::string_view token = binds.substr(0, comma);
++    binds = comma == std::string_view::npos ? std::string_view() : binds.substr(comma + 1);
++    while (!token.empty() && token.front() == ' ') token.remove_prefix(1);
++    while (!token.empty() && token.back() == ' ') token.remove_suffix(1);
++    if (const PadControl* control = FindPadControl(token)) {
++      value = std::max(value, PadControlValue(pad, *control));
++    }
++  }
++  return value;
++}
++
++// Applies the padbind_* options to a physical controller's state.
++void RemapGamepad(X_INPUT_GAMEPAD& pad) {
++  const std::string binds[] = {
++      REXCVAR_GET(padbind_a),          REXCVAR_GET(padbind_b),
++      REXCVAR_GET(padbind_x),          REXCVAR_GET(padbind_y),
++      REXCVAR_GET(padbind_left_shoulder), REXCVAR_GET(padbind_right_shoulder),
++      REXCVAR_GET(padbind_left_trigger),  REXCVAR_GET(padbind_right_trigger),
++      REXCVAR_GET(padbind_back),       REXCVAR_GET(padbind_start),
++      REXCVAR_GET(padbind_lstick_press),  REXCVAR_GET(padbind_rstick_press),
++      REXCVAR_GET(padbind_dpad_up),    REXCVAR_GET(padbind_dpad_down),
++      REXCVAR_GET(padbind_dpad_left),  REXCVAR_GET(padbind_dpad_right),
++  };
++  static_assert(std::size(binds) == std::size(kPadControls));
++  bool identity = true;
++  for (size_t i = 0; i < std::size(kPadControls); i++) {
++    identity = identity && binds[i] == kPadControls[i].name;
++  }
++  if (identity) {
++    return;
++  }
++
++  const X_INPUT_GAMEPAD source = pad;
++  // Keep the bits that cannot be remapped (the guide button).
++  uint16_t buttons = static_cast<uint16_t>(source.buttons) & X_INPUT_GAMEPAD_GUIDE;
++  uint8_t left_trigger = 0;
++  uint8_t right_trigger = 0;
++  for (size_t i = 0; i < std::size(kPadControls); i++) {
++    uint8_t value = PadBindValue(source, binds[i]);
++    switch (kPadControls[i].trigger) {
++      case PadTrigger::kLeft:
++        left_trigger = value;
++        break;
++      case PadTrigger::kRight:
++        right_trigger = value;
++        break;
++      default:
++        if (value >= kTriggerThreshold) {
++          buttons |= kPadControls[i].button;
++        }
++        break;
++    }
++  }
++  pad.buttons = buttons;
++  pad.left_trigger = left_trigger;
++  pad.right_trigger = right_trigger;
++}
++
+ }  // namespace
+ 
+ InputSystem::InputSystem(rex::ui::Window* window) : window_(window) {}
+@@ -233,6 +380,11 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+     if (driver->GetDeviceState(id, &state) != X_ERROR_SUCCESS) {
+       continue;
+     }
++    // Keyboard and mouse have their own binds (keybind_*).
++    const DeviceInfo* info = DeviceInfoFor(id);
++    if (info && !info->synthetic) {
++      RemapGamepad(state.gamepad);
++    }
+     active_devices_.Observe(user_index, id, state.gamepad);
+     if (!any) {
+       merged = state;
+diff --git a/src/kernel/xam/xam_info.cpp b/src/kernel/xam/xam_info.cpp
+index 1fda053..f5a8788 100644
+--- a/src/kernel/xam/xam_info.cpp
++++ b/src/kernel/xam/xam_info.cpp
+@@ -15,6 +15,7 @@
+ #include <rex/hook.h>
+ #include <rex/types.h>
+ #include <rex/string.h>
++#include <rex/system/flags.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/user_module.h>
+ #include <rex/system/xenumerator.h>
+@@ -183,6 +184,14 @@ u32 XGetGameRegion_entry() {
+ }
+ 
+ u32 XGetLanguage_entry() {
++  // Use the configured user language when it is valid, like the console's
++  // system language setting.
++  uint32_t user_language = REXCVAR_GET(user_language);
++  if (user_language > uint32_t(XLanguage::kInvalid) &&
++      user_language < uint32_t(XLanguage::kMaxLanguages)) {
++    return user_language;
++  }
++
+   auto desired_language = XLanguage::kEnglish;
+ 
+   // Switch the language based on game region.
+diff --git a/src/kernel/xam/xam_net.cpp b/src/kernel/xam/xam_net.cpp
+index 58e36a4..7d5e824 100644
+--- a/src/kernel/xam/xam_net.cpp
++++ b/src/kernel/xam/xam_net.cpp
+@@ -24,6 +24,7 @@
+ #include <rex/kernel/xboxkrnl/error.h>
+ #include <rex/kernel/xboxkrnl/threading.h>
+ #include <rex/logging.h>
++#include <rex/net/socket.h>
+ #include <rex/hook.h>
+ #include <rex/types.h>
+ #include <rex/string.h>
+@@ -620,12 +621,7 @@ i32 NetDll_shutdown_entry(u32 caller, u32 socket_handle, i32 how) {
+ 
+   auto ret = socket->Shutdown(how);
+   if (ret == -1) {
+-#if REX_PLATFORM_WIN32
+-    uint32_t error_code = WSAGetLastError();
+-    XThread::SetLastError(error_code);
+-#else
+-    XThread::SetLastError(0x0);
+-#endif
++    XThread::SetLastError(rex::net::socket_last_error());
+   }
+   return ret;
+ }
+@@ -883,13 +879,7 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
+   }
+ 
+   if (ret == -1) {
+-// TODO: Better way of getting the error code
+-#if REX_PLATFORM_WIN32
+-    uint32_t error_code = WSAGetLastError();
+-    XThread::SetLastError(error_code);
+-#else
+-    XThread::SetLastError(0x0);
+-#endif
++    XThread::SetLastError(rex::net::socket_last_error());
+   }
+ 
+   return ret;
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_memory.cpp b/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
+index 8684eda..ba1f13f 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
+@@ -15,6 +15,7 @@
+ #include <cstring>
+ 
+ #include <rex/assert.h>
++#include <rex/cvar.h>
+ #include <rex/kernel/xboxkrnl/private.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
+@@ -23,6 +24,10 @@
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xtypes.h>
+ 
++REXCVAR_DEFINE_BOOL(alloc_top_down, false, "Kernel",
++                    "Allocate 4 KB-page virtual memory without a base address top-down "
++                    "(experimental: matches the address layout some games depend on)");
++
+ namespace rex::kernel::xboxkrnl {
+ using namespace rex::system;
+ 
+@@ -167,7 +172,8 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
+       address = adjusted_base;
+     }
+   } else {
+-    bool top_down = !!(alloc_type & X_MEM_TOP_DOWN);
++    bool top_down = !!(alloc_type & X_MEM_TOP_DOWN) ||
++                    (REXCVAR_GET(alloc_top_down) && page_size == 4 * 1024);
+     heap = REX_KERNEL_MEMORY()->LookupHeapByType(false, page_size);
+     heap->Alloc(adjusted_size, page_size, allocation_type, protect, top_down, &address);
+   }
+diff --git a/src/system/runtime.cpp b/src/system/runtime.cpp
+index c10694c..9e837c8 100644
+--- a/src/system/runtime.cpp
++++ b/src/system/runtime.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
++#include <rex/filesystem/devices/disc_image_device.h>
+ #include <rex/filesystem/devices/host_path_device.h>
+ #include <rex/filesystem/devices/null_device.h>
+ #include <rex/filesystem/vfs.h>
+@@ -303,12 +304,19 @@ bool Runtime::SetupVfs() {
+     return false;
+   }
+ 
+-  // Mount game_data_root as \Device\Harddisk0\Partition1
++  // Mount game_data_root as \Device\Harddisk0\Partition1: a folder with the
++  // extracted game files, or a disc image (.iso) read in place.
+   auto mount_path = "\\Device\\Harddisk0\\Partition1";
+-  auto device = std::make_unique<rex::filesystem::HostPathDevice>(
+-      mount_path, abs_game_root, !REXCVAR_GET(allow_game_relative_writes));
++  std::unique_ptr<rex::filesystem::Device> device;
++  if (std::filesystem::is_regular_file(abs_game_root)) {
++    device = std::make_unique<rex::filesystem::DiscImageDevice>(mount_path, abs_game_root);
++  } else {
++    device = std::make_unique<rex::filesystem::HostPathDevice>(
++        mount_path, abs_game_root, !REXCVAR_GET(allow_game_relative_writes));
++  }
+   if (!device->Initialize()) {
+-    REXSYS_ERROR("Runtime::SetupVfs: Failed to initialize host path device");
++    REXSYS_ERROR("Runtime::SetupVfs: Failed to initialize the game device for {}",
++                 abs_game_root.string());
+     return false;
+   }
+   if (!file_system_->RegisterDevice(std::move(device))) {
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 77bce25..c22ab12 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -1449,6 +1449,15 @@ void XHostThread::Execute() {
+   // Let the kernel know we are starting.
+   kernel_state_->OnThreadExecute(this);
+ 
++  // Host threads also run guest code (audio callbacks, GPU interrupts): like in
++  // XThread::Execute, the FP context must be initialized from the host state.
++  // With csr = 0, enableFlushModeUnconditional() would write only the flush
++  // bits to MXCSR, unmasking every FP exception (Dead or Alive 4 crashed with
++  // STATUS_FLOAT_INEXACT_RESULT in the audio mixer when its intro video starts).
++  if (thread_state_) {
++    thread_state_->context()->fpscr.InitHost();
++  }
++
+   int ret = host_fn_();
+ 
+   // Exit.
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index 5bd3dc5..c4ebb74 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -116,12 +116,15 @@ target_link_libraries(rexui PUBLIC
+ )
+ target_link_libraries(rexui PRIVATE utf8cpp)
+ 
++# FSR 1 (EASU + RCAS) and CAS use shaders built into the SDK, so they are always
++# available. Only the temporal upscalers (FSR 2/3) need the FidelityFX SDK
++# (REX_HAS_FIDELITYFX_RUNTIME below).
++target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_SDK=1)
+ if(REXGLUE_FIDELITYFX_SOURCE_DIR AND EXISTS "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sdk/include")
+     target_include_directories(rexui PRIVATE
+         "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sdk/include"
+         "${REXGLUE_FIDELITYFX_SOURCE_DIR}/ffx-api/include"
+     )
+-    target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_SDK=1)
+ endif()
+ 
+ set(REXUI_HAS_FIDELITYFX_RUNTIME OFF)
+diff --git a/src/ui/d3d12/d3d12_provider.cpp b/src/ui/d3d12/d3d12_provider.cpp
+index bf8252b..c6835c5 100644
+--- a/src/ui/d3d12/d3d12_provider.cpp
++++ b/src/ui/d3d12/d3d12_provider.cpp
+@@ -19,6 +19,7 @@
+ #include <rex/ui/d3d12/d3d12_provider.h>
+ 
+ #include <malloc.h>
++#include <dxgi1_6.h>
+ 
+ REXCVAR_DEFINE_BOOL(d3d12_debug, false, "UI/D3D12", "Enable Direct3D 12 and DXGI debug layer")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+@@ -251,9 +252,24 @@ bool D3D12Provider::Initialize() {
+   }
+ 
+   // Choose the adapter.
++  // With the default (any physical adapter), enumerate by GPU preference so the
++  // high-performance GPU is chosen: in plain enumeration order the first
++  // adapter is the one driving the display, which on hybrid-graphics laptops is
++  // the integrated GPU (Dead or Alive 4 ran on a Radeon iGPU instead of an RTX).
++  IDXGIFactory6* dxgi_factory6 = nullptr;
++  if (REXCVAR_GET(d3d12_adapter) == -1) {
++    dxgi_factory->QueryInterface(IID_PPV_ARGS(&dxgi_factory6));
++  }
++  auto enum_adapter = [&](uint32_t index, IDXGIAdapter1** adapter_out) -> HRESULT {
++    if (dxgi_factory6) {
++      return dxgi_factory6->EnumAdapterByGpuPreference(
++          index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(adapter_out));
++    }
++    return dxgi_factory->EnumAdapters1(index, adapter_out);
++  };
+   uint32_t adapter_index = 0;
+   IDXGIAdapter1* adapter = nullptr;
+-  while (dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
++  while (enum_adapter(adapter_index, &adapter) == S_OK) {
+     DXGI_ADAPTER_DESC1 adapter_desc;
+     if (SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
+       if (SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0, _uuidof(ID3D12Device),
+@@ -277,6 +293,9 @@ bool D3D12Provider::Initialize() {
+     adapter = nullptr;
+     ++adapter_index;
+   }
++  if (dxgi_factory6) {
++    dxgi_factory6->Release();
++  }
+   if (adapter == nullptr) {
+     REXLOG_ERROR(
+         "Failed to get an adapter supporting Direct3D 12 with the feature "
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index b94fe9e..ff8aca4 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -51,6 +51,11 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
+                       "GPU emulation")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU",
++                      "Graphics API of the GPU plugin: any (first available), d3d12, vulkan")
++    .allowed({"any", "d3d12", "vulkan"})
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ namespace rex {
+ 
+ // --- ReXApp ---
+@@ -207,7 +212,9 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
+     return false;
+   }
+-  if (!std::filesystem::is_directory(paths.game_data_root)) {
++  // A folder with the extracted game files, or a disc image (.iso) file.
++  const bool disc_image = std::filesystem::is_regular_file(paths.game_data_root);
++  if (!disc_image && !std::filesystem::is_directory(paths.game_data_root)) {
+     auto msg = fmt::format("--game_data_root does not exist: {}", paths.game_data_root.string());
+     REXLOG_ERROR("{}", msg);
+     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
+@@ -263,7 +270,8 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+   OnLoadXexImage(xex_image);
+ 
+   // Mirrors the game:\ / d:\ -> game_data_root mapping in Runtime::SetupVfs.
+-  {
++  // A disc image cannot be checked on the host: LoadXexImage reports it.
++  if (!disc_image) {
+     constexpr std::string_view kGameDevice = "game:\\";
+     constexpr std::string_view kDDevice = "d:\\";
+     std::string_view tail = xex_image;
+@@ -314,7 +322,8 @@ bool ReXApp::SetupPresentation() {
+   OnPreSetup(config_);
+ 
+   if (!config_.graphics && !config_.gpu_plugin.empty()) {
+-    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin);
++    config_.graphics =
++        rex::system::LoadGpuPlugin(config_.gpu_plugin, REXCVAR_GET(gpu_backend));
+     if (!config_.graphics) {
+       // Fatal by design: no silent headless fallback.
+       auto msg =
+diff --git a/src/ui/vulkan/vulkan_provider.cpp b/src/ui/vulkan/vulkan_provider.cpp
+index 9eeb902..94c2ade 100644
+--- a/src/ui/vulkan/vulkan_provider.cpp
++++ b/src/ui/vulkan/vulkan_provider.cpp
+@@ -88,9 +88,7 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
+     bool prefer_fragment_stores = REXCVAR_GET(vulkan_prefer_fragment_stores_and_atomics);
+     bool prefer_vertex_stores = REXCVAR_GET(vulkan_prefer_vertex_pipeline_stores_and_atomics);
+     bool prefer_fill_mode_non_solid = REXCVAR_GET(vulkan_prefer_fill_mode_non_solid);
+-    if (with_gpu_emulation && physical_devices.size() > 1 &&
+-        (prefer_geometry_shader || prefer_fragment_stores || prefer_vertex_stores ||
+-         prefer_fill_mode_non_solid)) {
++    if (with_gpu_emulation && physical_devices.size() > 1) {
+       struct PhysicalDeviceScore {
+         VkPhysicalDevice physical_device;
+         uint32_t score;
+@@ -113,6 +111,14 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
+         if (prefer_fill_mode_non_solid && supported_features.fillModeNonSolid) {
+           ++score;
+         }
++        // Prefer the dedicated GPU, like the D3D12 provider: in enumeration
++        // order, hybrid-graphics laptops often list the integrated GPU first.
++        // Outweighs the feature preferences, which each add only 1.
++        VkPhysicalDeviceProperties properties;
++        ifn.vkGetPhysicalDeviceProperties(physical_device, &properties);
++        if (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
++          score += 8;
++        }
+         scored_devices.push_back({physical_device, score});
+       }
+ 

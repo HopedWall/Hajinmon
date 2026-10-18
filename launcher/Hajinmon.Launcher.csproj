@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>Hajinmon</AssemblyName>
+    <RootNamespace>Hajinmon.Launcher</RootNamespace>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>false</SelfContained>
+    <Product>Hajinmon</Product>
+    <Version>1.0.0</Version>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <Description>Dead or Alive 4, now on PC</Description>
+  </PropertyGroup>
+
+  <!-- Release builds (tools\make_release.cmd) embed the game runtime: HajinmonGame.exe
+       and its DLLs, no game data. -->
+  <ItemGroup Condition="'$(GameRuntimeZip)' != ''">
+    <EmbeddedResource Include="$(GameRuntimeZip)" LogicalName="game_runtime.zip" />
+  </ItemGroup>
+
+</Project>

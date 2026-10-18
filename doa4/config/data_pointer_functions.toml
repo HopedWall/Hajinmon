@@ -1,0 +1,47 @@
+# Functions that are only reachable through pointers in data (vtables, CRT
+# initializer tables...) and that the analyzer does not find on its own.
+# Generated with: py tools/find_missing_funcs.py build/default.bin doa4/generated/default/doa4_init.cpp --toml
+# (excluding SEH handlers inside .pdata functions and switch cases, which appear as loc_ labels in the generated code).
+[functions]
+0x822FFA38 = {}  # referenced from 0x8203C1AC, 0x821FEEF8, 0x822868A4
+0x8236EB78 = {}  # referenced from 0x82C9D474
+0x82491D50 = {}  # referenced from 0x82286938, 0x82286964, 0x822869D0
+0x8253C990 = {}  # referenced from 0x82288DC8
+0x8253C9A0 = {}  # referenced from 0x82288D58, 0x82288DA0
+0x82554BF0 = {}  # referenced from 0x822890E4, 0x8228924C, 0x822893DC
+0x8256BF00 = {}  # referenced from 0x82289094, 0x822891FC, 0x82289824
+0x8256BF10 = {}  # referenced from 0x822890A0, 0x82289208, 0x82289398
+0x8256BF20 = {}  # referenced from 0x822890CC, 0x82289234, 0x822893C4
+0x82572C70 = {}  # referenced from 0x82289458, 0x82289D70, 0x8228A060
+0x825A2978 = {}  # referenced from 0x82289F90
+0x82625AF0 = {}  # referenced from 0x8228BA40
+0x826425D8 = {}  # referenced from 0x82289A00, 0x8228B968
+0x826E68D8 = {}  # referenced from 0x8228E650, 0x8228E658
+0x827760F8 = {}  # referenced from 0x822A8A98, 0x822A8D20
+0x827DFA80 = {}  # referenced from 0x82007FC8, 0x82008250, 0x82011528
+0x827DFE88 = {}  # referenced from 0x8200818C, 0x82008414, 0x820116EC
+0x827DFEB0 = {}  # referenced from 0x82008190, 0x82008418, 0x820116F0
+0x827DFED8 = {}  # referenced from 0x82008194, 0x8200841C, 0x820116F4
+0x827DFF00 = {}  # referenced from 0x82008198, 0x82008420, 0x820116F8
+0x827E0330 = {}  # referenced from 0x820081CC, 0x82008454
+0x82833300 = {}  # referenced from 0x8201FC34, 0x82020C64, 0x82021D44
+0x828F8130 = {}  # referenced from 0x8202ABD8, 0x8202AC68
+0x829329F0 = {}  # referenced from 0x8202FBB4, 0x8202FBD4
+0x82959FA0 = {}  # referenced from 0x82037F34, 0x82037F70, 0x82037FCC
+0x82959FB0 = {}  # referenced from 0x82037CFC, 0x82B7E5DC
+0x8295A798 = {}  # referenced from 0x82037FB8
+0x8295A7A0 = {}  # referenced from 0x82037FBC
+0x8295A7A8 = {}  # referenced from 0x82037FC0
+0x82963898 = {}  # referenced from 0x82039050, 0x82039138
+0x829638A0 = {}  # referenced from 0x82039054, 0x8203913C
+0x829638A8 = {}  # referenced from 0x820390D0
+0x829638B0 = {}  # referenced from 0x820390D4
+0x829638B8 = {}  # referenced from 0x82038FF0, 0x820390D8
+0x829638D8 = {}  # referenced from 0x8203900C, 0x820390F4
+0x829638E0 = {}  # referenced from 0x820390F8
+0x829638F0 = {}  # referenced from 0x82039100
+0x82963900 = {}  # referenced from 0x82039108
+0x82978FD8 = {}  # referenced from 0x8203B5A4, 0x8203B62C, 0x8203B6B4
+0x8298A790 = {}  # referenced from 0x8203CA9C
+0x829CE668 = {}  # referenced from 0x8204CE48
+0x82B451C0 = {}  # referenced from 0x82B60024
