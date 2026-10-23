@@ -15,6 +15,7 @@
 #include "crash_trace.h"
 #include "frame_capture.h"
 #include "input_defaults.h"
+#include "renderer_select.h"
 #include "save_trace.h"
 #include "user_data.h"
 
@@ -43,7 +44,16 @@ class Doa4App : public rex::ReXApp {
   // \Device\cache0 and looks for the .afs archives there. The runtime cannot
   // provide that cache, so we remove the NullDevice: the game sees a console
   // without a hard drive (like a 360 Core) and reads everything from game:\.
+  // --renderer=plume replaces the SDK's Xenos emulation with the native renderer.
+  void OnPreSetup(rex::RuntimeConfig& config) override {
+    if (!config.graphics) {
+      config.graphics = doa4::CreateSelectedGraphicsSystem();
+      graphics_ = config.graphics.get();
+    }
+  }
+
   void OnPostSetup() override {
+    doa4::AttachWindowToRenderer(graphics_, window());
     doa4::StartFrameCapture(runtime());
     doa4::StartSaveTrace();
     doa4::StartCheats();
@@ -55,11 +65,13 @@ class Doa4App : public rex::ReXApp {
   }
 
   // Override virtual hooks for customization:
-  // void OnPreSetup(rex::RuntimeConfig& config) override {}
   // void OnLoadXexImage(std::string& xex_image) override {}
   // void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {}
   // std::unique_ptr<rex::ui::ImGuiDialog> CreateAchievementsOverlay() override;
   // std::unique_ptr<rex::ui::AchievementNotificationDialog>
   // CreateAchievementNotificationDialog() override;
   // void OnShutdown() override {}
+
+ private:
+  rex::system::IGraphicsSystem* graphics_ = nullptr;  // Set only for the native renderer.
 };

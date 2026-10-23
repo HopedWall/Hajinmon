@@ -20,6 +20,7 @@ set(DOA4_SOURCES
     src/game_fixes.cpp
     src/save_trace.cpp
     src/user_data.cpp
+    src/renderer_select.cpp
 )
 
 if(WIN32)
@@ -29,6 +30,14 @@ else()
 endif()
 
 rexglue_setup_target(doa4)
+
+# Experimental native renderer (Plume), selected with --renderer=plume.
+option(HAJINMON_PLUME_RENDERER "Build the experimental native Plume renderer" ON)
+if(HAJINMON_PLUME_RENDERER)
+    add_subdirectory(../renderer renderer)
+    target_link_libraries(doa4 PRIVATE hajinmon_plume)
+    target_compile_definitions(doa4 PRIVATE HAJINMON_PLUME_RENDERER=1)
+endif()
 
 # "doa4" is the internal project name; players see the game as HajinmonGame.exe
 # (started by the Hajinmon.exe launcher).
