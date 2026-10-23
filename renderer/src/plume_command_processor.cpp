@@ -4,7 +4,9 @@
 
 #include <cmath>
 
+#include <fmt/format.h>
 #include <rex/logging/macros.h>
+#include <rex/system/xmemory.h>
 #include <xxhash.h>
 
 #include "plume_graphics_system.h"
@@ -22,27 +24,71 @@ PlumeCommandProcessor::~PlumeCommandProcessor() = default;
 
 bool PlumeCommandProcessor::SetupContext() {
   stats_start_ = std::chrono::steady_clock::now();
-  return plume_graphics_system_->renderer().Initialize();
+  PlumeRenderer& renderer = plume_graphics_system_->renderer();
+  if (!renderer.Initialize()) {
+    return false;
+  }
+  shader_cache_ = std::make_unique<ShaderCache>(renderer.is_vulkan() ? ShaderCompiler::Target::kSpirv
+                                                                     : ShaderCompiler::Target::kDxil);
+  return true;
 }
 
 void PlumeCommandProcessor::ShutdownContext() {
-  plume_graphics_system_->renderer().Shutdown();
+  shader_cache_.reset();
   shaders_.clear();
+  plume_graphics_system_->renderer().Shutdown();
+}
+
+void PlumeCommandProcessor::EnsureCatalog() {
+  if (catalog_.built()) {
+    return;
+  }
+  // Called once the executable is loaded.
+  constexpr uint32_t kImageBase = 0x82000000, kImageSize = 0x01600000;
+  const auto* image = plume_graphics_system_->memory()->TranslateVirtual<const uint8_t*>(kImageBase);
+  catalog_.Build(image, kImageBase, kImageSize);
+  size_t vertex = 0;
+  for (const CatalogShader& entry : catalog_.shaders()) {
+    vertex += entry.is_vertex_shader;
+  }
+  REXLOG_INFO("Plume: {} shaders in the executable ({} vertex, {} pixel)", catalog_.shaders().size(),
+              vertex, catalog_.shaders().size() - vertex);
+}
+
+void PlumeCommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
+                                                    uint32_t title_id, bool blocking) {
+  (void)blocking;
+  if (!shader_cache_) {
+    return;
+  }
+  EnsureCatalog();
+  std::filesystem::path directory = cache_root / "plume" / fmt::format("{:08X}", title_id) / "shaders";
+  shader_cache_->SetStorageDirectory(directory);
+  REXLOG_INFO("Plume: shader cache in {}", directory.string());
+  std::vector<ShaderCache::PrewarmShader> prewarm;
+  auto* memory = plume_graphics_system_->memory();
+  for (const CatalogShader& entry : catalog_.shaders()) {
+    prewarm.push_back({memory->TranslateVirtual<const uint32_t*>(entry.ucode_address),
+                       entry.ucode_dword_count, entry.is_vertex_shader});
+  }
+  shader_cache_->StartPrewarm(std::move(prewarm));
 }
 
 Shader* PlumeCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                                           const uint32_t* host_address, uint32_t dword_count) {
+  EnsureCatalog();
   uint64_t hash = XXH3_64bits(host_address, dword_count * sizeof(uint32_t));
   auto it = shaders_.find(hash);
   if (it != shaders_.end()) {
     return it->second.get();
   }
-  // Milestone 2 maps the guest address to the shader container in the
-  // executable, whose precompiled HLSL replaces the microcode.
   REXLOG_DEBUG("Plume: new {} shader {:016X} at 0x{:08X} ({} dwords)",
                shader_type == xenos::ShaderType::kVertex ? "vertex" : "pixel", hash, guest_address,
                dword_count);
   auto shader = std::make_unique<Shader>(shader_type, hash, host_address, dword_count);
+  if (shader_cache_) {
+    shader_cache_->RequestBuild(hash, shader_type, host_address, dword_count);
+  }
   Shader* result = shader.get();
   shaders_.emplace(hash, std::move(shader));
   return result;
@@ -86,10 +132,14 @@ void PlumeCommandProcessor::LogStats() {
   }
   REXLOG_INFO(
       "Plume ({}): {:.1f} guest FPS, {:.0f} draws and {:.1f} resolves per frame, {} presented, "
-      "{} shaders",
+      "{} shaders ({} compiled, {} from disk, {} failed, {} pending)",
       plume_graphics_system_->renderer().backend_name(), double(frames_) / seconds,
       frames_ ? double(draws_) / double(frames_) : 0.0,
-      frames_ ? double(copies_) / double(frames_) : 0.0, presented_, shaders_.size());
+      frames_ ? double(copies_) / double(frames_) : 0.0, presented_, shaders_.size(),
+      shader_cache_ ? shader_cache_->stats().compiled.load() : 0,
+      shader_cache_ ? shader_cache_->stats().loaded.load() : 0,
+      shader_cache_ ? shader_cache_->stats().failed.load() : 0,
+      shader_cache_ ? shader_cache_->pending_builds() : 0);
   frames_ = draws_ = copies_ = presented_ = 0;
   stats_start_ = now;
 }

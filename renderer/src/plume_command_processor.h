@@ -3,9 +3,9 @@
 // The SDK base class parses the GPU command stream (PM4 packets) on its own
 // thread and calls the Issue* methods for draws, resolves and frame swaps.
 //
-// Milestone 1: no drawing yet. Draws, resolves and shaders are counted, and
-// every swap presents a cleared frame, to validate the whole path (game ->
-// command stream -> Plume -> window).
+// Milestone 2: shaders are translated to HLSL and compiled in the background
+// as the game loads them. Nothing is drawn yet: draws and resolves are counted, and every swap
+// presents a cleared frame.
 
 #pragma once
 
@@ -16,6 +16,9 @@
 
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/pipeline/shader/shader.h>
+
+#include "shader_cache.h"
+#include "shader_catalog.h"
 
 namespace hajinmon::renderer {
 
@@ -33,6 +36,9 @@ class PlumeCommandProcessor : public rex::graphics::CommandProcessor {
   bool SetupContext() override;
   void ShutdownContext() override;
 
+  void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
+                               bool blocking) override;
+
   rex::graphics::Shader* LoadShader(rex::graphics::xenos::ShaderType shader_type,
                                     uint32_t guest_address, const uint32_t* host_address,
                                     uint32_t dword_count) override;
@@ -43,8 +49,11 @@ class PlumeCommandProcessor : public rex::graphics::CommandProcessor {
 
  private:
   void LogStats();
+  void EnsureCatalog();
 
   PlumeGraphicsSystem* plume_graphics_system_;
+  ShaderCatalog catalog_;
+  std::unique_ptr<ShaderCache> shader_cache_;
   std::unordered_map<uint64_t, std::unique_ptr<rex::graphics::Shader>> shaders_;
 
   // Statistics, logged every few seconds.

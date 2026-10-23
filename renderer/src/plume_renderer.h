@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 #include "plume_render_interface.h"
@@ -33,6 +34,8 @@ class PlumeRenderer {
   bool PresentClear(float r, float g, float b);
 
   const char* backend_name() const { return backend_name_; }
+  // Vulkan takes SPIR-V shaders, Direct3D 12 DXIL.
+  bool is_vulkan() const { return std::string_view(backend_name_) == "Vulkan"; }
 
  private:
   bool EnsureSwapChain();
