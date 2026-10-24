@@ -19,6 +19,9 @@ runtime.
 - 60 FPS on a dedicated GPU, rendered at 2x (2560x1440) and shown in a
   1920x1080 window by default.
 - Two renderers: Direct3D 12 (default) and Vulkan.
+- Experimental native renderer (Plume, Windows): draws the game with its
+  shaders translated to HLSL instead of emulating the Xbox 360 GPU, with MSAA.
+  Opt-in, in the launcher's *Graphics* tab (see [Native renderer](#native-renderer)).
 - Xbox controllers and keyboard/mouse work out of the box.
 - Not everything has been tested yet. See [Troubleshooting](#troubleshooting)
   for how to collect information about crashes and graphical issues.
@@ -116,7 +119,19 @@ This clones ReXGlue v0.10.0 into `external\rexglue-sdk`, applies the fixes in
 build takes a while (30-60 minutes depending on the machine). It only needs to
 be done once.
 
-#### 4. Build the game
+#### 4. Get the native renderer's dependencies
+
+```
+tools\setup_plume.cmd
+```
+
+This clones [Plume](https://github.com/renderbag/plume) (the graphics library
+of the native renderer) into `external\plume` and the
+[DXC binaries](https://github.com/renderbag/dxc-bin) (the shader compiler) into
+`external\dxc-bin`, at pinned commits. To build without the native renderer,
+configure the game with `-DHAJINMON_PLUME_RENDERER=OFF` instead.
+
+#### 5. Build the game
 
 ```
 tools\build_doa4.cmd
@@ -128,7 +143,7 @@ it. This produces `doa4\out\build\win-amd64-relwithdebinfo\HajinmonGame.exe`. It
 parallel jobs by default; if the build runs out of memory, lower it with
 `set JOBS=4` before running the script.
 
-#### 5. Build the launcher
+#### 6. Build the launcher
 
 The launcher needs the [.NET 9 SDK](https://dotnet.microsoft.com/download/dotnet/9.0)
 (`winget install --id Microsoft.DotNet.SDK.9 -e`):
@@ -140,7 +155,7 @@ tools\build_launcher.cmd
 This produces `build\launcher\Hajinmon.exe`, which starts the `HajinmonGame.exe` built
 in the previous step.
 
-#### 6. Play
+#### 7. Play
 
 Start `build\launcher\Hajinmon.exe`, adjust the settings if you like and press
 **Play** (see [Launcher](#launcher)). Alternatively, start the game directly
@@ -150,7 +165,7 @@ with the developer script, which also writes a debug log to `build\run.log`:
 tools\run_doa4.cmd
 ```
 
-#### 7. Make a release
+#### 8. Make a release
 
 ```
 tools\make_release.cmd
@@ -168,11 +183,13 @@ The launcher starts the game (`HajinmonGame.exe`) with the command line options 
 settings (shown in the *Advanced* tab). Settings are stored in
 `%LOCALAPPDATA%\Hajinmon\settings.json`.
 
-- **Graphics**: windowed or fullscreen, window size, internal resolution
-  (1x-4x the Xbox 360's 720p), texture filtering (anisotropic up to 16x),
-  anti-aliasing (FXAA), scaling filter (bilinear, AMD CAS sharpening or AMD FSR
-  upscaling), VSync, 16:9 letterboxing, the graphics API (Direct3D 12 or
-  Vulkan) and the GPU to use.
+- **Graphics**: the renderer (Xenia, the emulated Xbox 360 GPU, or the
+  experimental native Plume renderer), windowed or fullscreen, window size,
+  internal resolution (1x-4x the Xbox 360's 720p), texture filtering
+  (anisotropic up to 16x), anti-aliasing (FXAA; MSAA with Plume), scaling filter
+  (bilinear, AMD CAS sharpening or AMD FSR upscaling), VSync, 16:9
+  letterboxing, the graphics API (Direct3D 12 or Vulkan) and the GPU to use.
+  With Plume, FXAA, CAS/FSR and the GPU choice are not available.
 - **Game**: language (English, Japanese, German, French, Spanish, Italian),
   save folder, game (the `.iso` disc image or the folder extracted from it) and
   game executable. Empty paths use the defaults shown in grey: the release
@@ -267,6 +284,31 @@ the command line (see `tools\run_doa4.cmd`); boolean options are enabled with
 
 In game, `` ` `` (backtick) opens the runtime console and `F4` the settings.
 
+## Native renderer
+
+`--renderer=plume` replaces the Xbox 360 GPU emulation with an experimental
+native renderer built on [Plume](https://github.com/renderbag/plume). The
+game's shader microcode is translated to HLSL and compiled with DXC on
+background threads; the compiled shaders are cached in the user data folder
+(`cache\plume`), and the shaders seen in earlier sessions are compiled again at
+startup, so the first time a new shader appears is the only stall. It is
+Windows-only for now and has only been tested on Direct3D 12.
+
+| Option | Description |
+|---|---|
+| `--renderer=plume` | Use the native renderer (`xenia`, the default, is the emulated GPU). |
+| `--plume_backend=d3d12` | Graphics API: `auto`, `d3d12` or `vulkan` (untested). |
+| `--plume_resolution_scale=N` | Internal resolution multiplier, 1-4 (default 2). |
+| `--plume_msaa=N` | Samples per pixel (2, 4 or 8, default 4) of the surfaces the game renders with MSAA. |
+| `--plume_anisotropic=N` | Texture filtering: `-1` game default, `0` off, `2`-`5` = 2x/4x/8x/16x. |
+| `--no-plume_vsync` | Present without waiting for the vertical blank (tearing). |
+| `--no-plume_letterbox` | Stretch the image instead of keeping 16:9. |
+| `--plume_async_shaders` | Skip draws whose shaders are still compiling instead of waiting for them. |
+
+`F3` saves a screenshot to `Pictures\Hajinmon`. For debugging,
+`--plume_capture_path=FOLDER` saves a frame every `--plume_capture_interval`
+frames and `--plume_dump_shaders=FOLDER` writes the HLSL of every shader.
+
 ## Troubleshooting
 
 - **Low frame rate**: check the `DXGI adapter` line at the top of
@@ -291,6 +333,7 @@ In game, `` ` `` (backtick) opens the runtime console and `F4` the settings.
 |---|---|
 | `doa4/` | The ReXGlue project: `doa4_manifest.toml` (recompilation settings), `src/` (application code, game fixes and cheats), `generated/` (SDK build glue; the recompiled C++ code is generated into `generated/default/` by the build and is not committed), `config/` (extra function definitions). |
 | `launcher/` | The launcher (C# / Windows Forms, .NET 9). |
+| `renderer/` | The native renderer: Xenos microcode to HLSL translator, shader cache, render targets and resolves, textures and pipelines on Plume, and `hajinmon_shader_tool`, which checks offline that every shader of the executable translates and compiles. |
 | `patches/` | Fixes to the ReXGlue SDK runtime, applied by `tools\setup_sdk.cmd`. |
 | `tools/` | Build/run scripts and analysis tools. |
 
@@ -344,6 +387,15 @@ In game, `` ` `` (backtick) opens the runtime console and `F4` the settings.
    - `--game_data_root` also accepts a disc image (`.iso`), read in place;
    - `--log_guest_fps` logs the guest frame rate.
 
+4. The native renderer (`renderer/`) keeps the SDK's GPU front end (registers,
+   command stream, interrupts, shader microcode analysis) and replaces the
+   Xenos emulation behind it. Shaders go through an HLSL backend of the SDK's
+   shader translator; the guest's physical memory is mirrored on the GPU for
+   vertex fetches; each EDRAM surface becomes a host render target (MSAA
+   included), and resolves copy them to host textures used directly when the
+   game samples or presents them, instead of going through guest memory;
+   guest textures are untiled on the CPU into bindless descriptor arrays.
+
 ## Credits
 
 - [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk), the recompilation
@@ -351,6 +403,9 @@ In game, `` ` `` (backtick) opens the runtime console and `F4` the settings.
 - [Xenia](https://xenia.jp/), whose kernel and GPU emulation ReXGlue builds on.
 - [XenonRecomp](https://github.com/hedge-dev/XenonRecomp), which pioneered
   Xbox 360 static recompilation.
+- [Plume](https://github.com/renderbag/plume), the graphics library of the
+  native renderer, and [DXC](https://github.com/microsoft/DirectXShaderCompiler),
+  its shader compiler.
 
 ## License
 
