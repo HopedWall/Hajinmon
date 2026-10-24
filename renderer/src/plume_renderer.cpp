@@ -5,9 +5,12 @@
 #include "png_writer.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <string>
+#include <thread>
 
 #include <fmt/format.h>
 
@@ -287,6 +290,17 @@ void PlumeRenderer::Retire(std::unique_ptr<plume::RenderFramebuffer> framebuffer
   frames_[frame_slot_].retired_framebuffers.push_back(std::move(framebuffer));
 }
 
+std::filesystem::path PlumeRenderer::ScreenshotDirectory() {
+#ifdef _WIN32
+  const char* home = std::getenv("USERPROFILE");
+#else
+  const char* home = std::getenv("HOME");
+#endif
+  return std::filesystem::path(home ? home : ".") / "Pictures" / "Hajinmon";
+}
+
+void PlumeRenderer::RequestScreenshot() { screenshot_requested_ = true; }
+
 PlumeRenderer::Allocation PlumeRenderer::Upload(uint64_t size, uint64_t alignment) {
   command_list();
   Frame& frame = frames_[frame_slot_];
@@ -361,12 +375,13 @@ bool PlumeRenderer::EndFrame(TrackedTexture* source, uint32_t width, uint32_t he
     list->barriers(plume::RenderBarrierStage::NONE,
                    plume::RenderTextureBarrier(target, plume::RenderTextureLayout::PRESENT));
   }
-  // Debugging capture of the presented image.
+  // Screenshots (F3), and the periodic debugging capture of the presented image.
   std::string capture_path = REXCVAR_GET(plume_capture_path);
   int32_t capture_interval = std::max(REXCVAR_GET(plume_capture_interval), 1);
-  bool capture = !capture_path.empty() && source && width && height &&
-                 source->format == plume::RenderFormat::R8G8B8A8_UNORM &&
-                 frame_number_ % uint64_t(capture_interval) == 0;
+  bool capturable = source && width && height && source->format == plume::RenderFormat::R8G8B8A8_UNORM;
+  bool screenshot = capturable && screenshot_requested_.exchange(false);
+  bool capture = capturable && (screenshot || (!capture_path.empty() &&
+                                               frame_number_ % uint64_t(capture_interval) == 0));
   uint32_t capture_row = (width * 4 + 255) & ~255u;
   if (capture) {
     uint64_t size = uint64_t(capture_row) * height;
@@ -409,10 +424,25 @@ bool PlumeRenderer::EndFrame(TrackedTexture* source, uint32_t width, uint32_t he
       }
     }
     capture_buffer_->unmap();
-    std::filesystem::path path =
-        std::filesystem::path(capture_path) / fmt::format("plume_frame_{:06}.png", frame_number_);
-    WritePng(path, width, height, pixels.data());
-    REXLOG_INFO("Plume: saved {}", path.string());
+    std::filesystem::path path;
+    if (screenshot) {
+      std::time_t now = std::time(nullptr);
+      char name[64];
+      std::strftime(name, sizeof(name), "Hajinmon %Y-%m-%d %H-%M-%S.png", std::localtime(&now));
+      std::error_code error;
+      std::filesystem::create_directories(ScreenshotDirectory(), error);
+      path = ScreenshotDirectory() / name;
+    } else {
+      path = std::filesystem::path(capture_path) / fmt::format("plume_frame_{:06}.png", frame_number_);
+    }
+    // Compressing takes a moment: not on the GPU thread.
+    std::thread([path, width, height, pixels = std::move(pixels)]() {
+      if (WritePng(path, width, height, pixels.data())) {
+        REXLOG_INFO("Plume: saved {}", path.string());
+      } else {
+        REXLOG_ERROR("Plume: could not write {}", path.string());
+      }
+    }).detach();
   }
   frame_open_ = false;
   frame_slot_ = (frame_slot_ + 1) % kFramesInFlight;

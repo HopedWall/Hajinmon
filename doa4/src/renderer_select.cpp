@@ -6,6 +6,7 @@
 
 #include <rex/cvar.h>
 #include <rex/logging/macros.h>
+#include <rex/ui/keybinds.h>
 #include <rex/ui/window.h>
 
 #if HAJINMON_PLUME_RENDERER
@@ -36,6 +37,12 @@ void AttachWindowToRenderer(rex::system::IGraphicsSystem* graphics, rex::ui::Win
   auto* plume = dynamic_cast<hajinmon::renderer::PlumeGraphicsSystem*>(graphics);
   if (plume && window) {
     plume->AttachWindow(window->GetNativeWindowHandle());
+    // The SDK's F3 debug overlay needs its presenter, which the native renderer
+    // replaces: F3 takes screenshots instead.
+    rex::ui::UnregisterBind("bind_debug_overlay");
+    rex::ui::RegisterBind("bind_screenshot", "F3", "Save a screenshot", [plume] {
+      plume->renderer().RequestScreenshot();
+    });
   }
 #else
   (void)graphics;

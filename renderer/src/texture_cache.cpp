@@ -317,7 +317,7 @@ uint32_t TextureCache::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
 TextureCache::Texture* TextureCache::GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   // Everything describing the data (not the sampler state).
   uint64_t key = (uint64_t(fetch.dword_1) << 32) ^ (uint64_t(fetch.dword_2) * 0x9E3779B97F4A7C15ull) ^
-                 (uint64_t(fetch.dword_0 & 0xFFC00001u) << 1) ^
+                 (uint64_t(fetch.dword_0 & 0xFFC003FDu) << 1) ^
                  (uint64_t(fetch.dword_5) * 0xC2B2AE3D27D4EB4Full) ^
                  (uint64_t(fetch.swizzle) << 50);
   std::unique_ptr<Texture>& texture = textures_[key];
@@ -334,6 +334,32 @@ TextureCache::Texture* TextureCache::GetTexture(const xenos::xe_gpu_texture_fetc
 bool TextureCache::Load(Texture& texture, const xenos::xe_gpu_texture_fetch_t& fetch) {
   auto format = xenos::TextureFormat(fetch.format);
   HostFormat host = GetHostFormat(format);
+  // Signed components (normal maps, for instance) read as -1...1: signed host
+  // formats, taking the sign of the first component for all of them.
+  if (fetch.sign_x == xenos::TextureSign::kSigned && host.conversion == Conversion::kCopy) {
+    switch (host.format) {
+      case plume::RenderFormat::R8_UNORM:
+        host.format = plume::RenderFormat::R8_SNORM;
+        break;
+      case plume::RenderFormat::R8G8_UNORM:
+        host.format = plume::RenderFormat::R8G8_SNORM;
+        break;
+      case plume::RenderFormat::R8G8B8A8_UNORM:
+        host.format = plume::RenderFormat::R8G8B8A8_SNORM;
+        break;
+      case plume::RenderFormat::R16_UNORM:
+        host.format = plume::RenderFormat::R16_SNORM;
+        break;
+      case plume::RenderFormat::R16G16_UNORM:
+        host.format = plume::RenderFormat::R16G16_SNORM;
+        break;
+      case plume::RenderFormat::R16G16B16A16_UNORM:
+        host.format = plume::RenderFormat::R16G16B16A16_SNORM;
+        break;
+      default:
+        break;
+    }
+  }
   const rex::graphics::FormatInfo* info = rex::graphics::FormatInfo::Get(format);
   if (host.format == plume::RenderFormat::UNKNOWN || !info) {
     if (!(unsupported_formats_logged_ & (uint64_t(1) << (uint32_t(format) & 63)))) {
@@ -505,6 +531,10 @@ void TextureCache::Bind(const xenos::xe_gpu_texture_fetch_t& fetch,
         resolved_format.components[2] = 0;
       }
       texture->swizzle = ComposeSwizzle(fetch.swizzle, resolved_format);
+      if (scale > 1) {
+        // Tells the shaders its size is scaled.
+        texture->swizzle |= 1u << 12;
+      }
       texture->loaded = true;
       if (texture->watch) {
         shared_memory_.UnwatchMemoryRange(texture->watch);

@@ -15,6 +15,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -23,6 +24,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <rex/graphics/pipeline/shader/shader.h>
@@ -55,22 +57,31 @@ class ShaderCache {
   // Thread-safe, as long as each thread uses its own Shader objects.
   bool Build(rex::graphics::Shader& shader, CompiledShader& out);
 
-  // Compiles the given shaders (microcode in guest memory, big-endian) to the
-  // disk cache on background threads.
+  // Compiles the given shaders (big-endian microcode) to the disk cache on
+  // background threads.
   struct PrewarmShader {
-    const uint32_t* ucode;
-    uint32_t dword_count;
+    std::vector<uint32_t> ucode;
     bool is_vertex_shader;
+    // From the executable: vertex shaders that fetch vertices are skipped, as
+    // the game patches them before use.
+    bool from_executable;
   };
   void StartPrewarm(std::vector<PrewarmShader> shaders);
   void StopPrewarm();
 
-  // Builds a shader the game loaded on a worker thread, so the GPU thread
-  // never waits for DXC. `ucode` is the guest microcode (big-endian).
+  // The shaders the game loaded in previous sessions (recorded in the storage
+  // directory), to prewarm: after a translator change they are all compiled
+  // at startup instead of when first drawn.
+  std::vector<PrewarmShader> LoadRecordedShaders();
+
+  // Builds a shader the game loaded on worker threads (several shaders build in
+  // parallel). `ucode` is the guest microcode (big-endian).
   void RequestBuild(uint64_t hash, rex::graphics::xenos::ShaderType type, const uint32_t* ucode,
                     uint32_t dword_count);
   // The result of RequestBuild, or null while it is still being built.
   const CompiledShader* Find(uint64_t hash) const;
+  // Like Find, but waits up to `timeout` for a requested build to finish.
+  const CompiledShader* Wait(uint64_t hash, std::chrono::milliseconds timeout);
   uint32_t pending_builds() const { return pending_builds_; }
 
   const Stats& stats() const { return stats_; }
@@ -86,6 +97,7 @@ class ShaderCache {
   };
   mutable std::mutex build_mutex_;
   std::condition_variable build_condition_;
+  std::condition_variable built_condition_;
   std::deque<BuildRequest> build_queue_;
   std::unordered_map<uint64_t, std::unique_ptr<CompiledShader>> built_;
   std::atomic<uint32_t> pending_builds_{0};
@@ -97,6 +109,9 @@ class ShaderCache {
   Stats stats_;
 
   std::vector<PrewarmShader> prewarm_shaders_;
+  std::filesystem::path recorded_path_;
+  std::mutex recorded_mutex_;
+  std::unordered_set<uint64_t> recorded_hashes_;
   std::atomic<size_t> prewarm_next_{0};
   std::atomic<uint32_t> prewarm_remaining_workers_{0};
   std::atomic<bool> prewarm_stop_{false};

@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include <fmt/format.h>
+#include <rex/cvar.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/logging/macros.h>
 #include <rex/string/buffer.h>
@@ -13,6 +14,9 @@
 #include <xxhash.h>
 
 #include "plume_graphics_system.h"
+
+REXCVAR_DEFINE_BOOL(plume_async_shaders, false, "GPU/Plume",
+                    "Skip draws whose shaders are still compiling instead of waiting for them");
 
 namespace hajinmon::renderer {
 
@@ -34,7 +38,9 @@ struct SystemConstants {
   float ndc_offset[4];
   float alpha_ref;
   uint32_t vertex_index_endian;
-  uint32_t padding[2];
+  // Host pixels per guest pixel (plume_resolution_scale).
+  float resolution_scale;
+  uint32_t padding;
   // Texture index | sampler index << 20, and swizzle, per texture slot.
   uint32_t vertex_textures[HlslShaderTranslator::kMaxTextureSlots][2];
   uint32_t pixel_textures[HlslShaderTranslator::kMaxTextureSlots][2];
@@ -132,11 +138,15 @@ void PlumeCommandProcessor::InitializeShaderStorage(const std::filesystem::path&
   std::filesystem::path directory = cache_root / "plume" / fmt::format("{:08X}", title_id) / "shaders";
   shader_cache_->SetStorageDirectory(directory);
   REXLOG_INFO("Plume: shader cache in {}", directory.string());
-  std::vector<ShaderCache::PrewarmShader> prewarm;
+  // Shaders loaded in previous sessions first (the most likely to be needed),
+  // then the executable's.
+  std::vector<ShaderCache::PrewarmShader> prewarm = shader_cache_->LoadRecordedShaders();
+  REXLOG_INFO("Plume: {} shaders recorded in previous sessions", prewarm.size());
   auto* memory = plume_graphics_system_->memory();
   for (const CatalogShader& entry : catalog_.shaders()) {
-    prewarm.push_back({memory->TranslateVirtual<const uint32_t*>(entry.ucode_address),
-                       entry.ucode_dword_count, entry.is_vertex_shader});
+    const auto* ucode = memory->TranslateVirtual<const uint32_t*>(entry.ucode_address);
+    prewarm.push_back({std::vector<uint32_t>(ucode, ucode + entry.ucode_dword_count),
+                       entry.is_vertex_shader, true});
   }
   shader_cache_->StartPrewarm(std::move(prewarm));
 }
@@ -218,9 +228,16 @@ bool PlumeCommandProcessor::Draw() {
       pixel_shader = nullptr;
     }
   }
-  const CompiledShader* vertex_compiled = shader_cache_->Find(vertex_shader->ucode_data_hash());
-  const CompiledShader* pixel_compiled =
-      pixel_shader ? shader_cache_->Find(pixel_shader->ucode_data_hash()) : nullptr;
+  // New shaders are compiled in the background; by default the draw waits for
+  // them (a short stall the first time a shader is seen) rather than being
+  // skipped (missing objects for a moment).
+  auto get_compiled = [&](const Shader* shader) {
+    return REXCVAR_GET(plume_async_shaders)
+               ? shader_cache_->Find(shader->ucode_data_hash())
+               : shader_cache_->Wait(shader->ucode_data_hash(), std::chrono::seconds(5));
+  };
+  const CompiledShader* vertex_compiled = get_compiled(vertex_shader);
+  const CompiledShader* pixel_compiled = pixel_shader ? get_compiled(pixel_shader) : nullptr;
   if (!vertex_compiled || !vertex_compiled->is_valid ||
       (pixel_shader && (!pixel_compiled || !pixel_compiled->is_valid))) {
     // Still compiling (or failed).
@@ -272,6 +289,7 @@ bool PlumeCommandProcessor::Draw() {
   system.alpha_test = color_control.alpha_test_enable ? uint32_t(color_control.alpha_func) : 7;
   std::memcpy(&system.alpha_ref, &regs.values[rex::graphics::XE_GPU_REG_RB_ALPHA_REF], sizeof(float));
   system.vertex_index_endian = uint32_t(primitive.host_shader_index_endian);
+  system.resolution_scale = float(render_target_cache_->scale());
   for (uint32_t i = 0; i < 4; ++i) {
     system.blend_control[i] = regs.values[reg::RB_BLENDCONTROL::rt_register_indices[i]];
   }

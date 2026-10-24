@@ -57,6 +57,8 @@ static float4 xe_ndc_scale;
 static float4 xe_ndc_offset;
 static float xe_alpha_ref;
 static uint xe_vertex_index_endian;
+// Host pixels per guest pixel.
+static float xe_resolution_scale;
 // Float constants and texture bindings of this stage.
 static uint xe_float_base;
 static uint xe_texture_base;
@@ -72,13 +74,15 @@ void xe_load_system_constants(bool is_pixel_shader) {
   v = xe_draw_constants.Load4(base + 48u);
   xe_alpha_ref = asfloat(v.x);
   xe_vertex_index_endian = v.y;
+  xe_resolution_scale = asfloat(v.z);
   xe_float_base = is_pixel_shader ? xe_push.pixel_float : xe_push.vertex_float;
   xe_texture_base = base + (is_pixel_shader ? 192u : 64u);
 }
 float4 xe_c(int index) {
   return asfloat(xe_draw_constants.Load4(xe_float_base + uint(clamp(index, 0, 255)) * 16u));
 }
-// x - texture index | sampler index << 20, y - swizzle (3 bits per component).
+// x - texture index | sampler index << 20, y - swizzle (3 bits per component),
+// and bit 12 if the texture is at the resolution scale.
 uint2 xe_texture_binding(uint slot) { return xe_draw_constants.Load2(xe_texture_base + slot * 8u); }
 // Xenos applies the blend factors to min/max blending, Direct3D 12 and Vulkan
 // ignore them: the factors depending only on the source are applied here
@@ -1082,6 +1086,8 @@ void HlslShaderTranslator::ProcessTextureFetchInstruction(
           Line(fmt::format("{}.GetDimensions(xe_ts.x, xe_ts.y);", texture));
         }
         Line("float3 xe_size = float3(max(xe_ts, 1u));");
+        // Textures rendered by the game are at the resolution scale (swizzle bit 12).
+        Line("if ((xe_tb.y & 0x1000u) != 0u) xe_size.xy /= xe_resolution_scale;");
       }
       std::string coord;
       if (is_cube) {
@@ -1260,7 +1266,8 @@ std::vector<uint8_t> HlslShaderTranslator::CompleteTranslation() {
     hlsl += "    r[xe_i] = xe_input.interpolators[xe_i];\n";
     hlsl += "  }\n";
     hlsl += "  if (xe_ps_param_gen != 0u) {\n";
-    hlsl += "    float2 xe_pixel = floor(xe_input.position.xy);\n";
+    // In guest pixels, also with resolution scaling.
+    hlsl += "    float2 xe_pixel = floor(xe_input.position.xy / xe_resolution_scale);\n";
     hlsl += "    float xe_x = xe_front_facing ? xe_pixel.x : asfloat(asuint(xe_pixel.x) | 0x80000000u);\n";
     hlsl += fmt::format("    r[min(xe_ps_param_gen - 1u, {}u)] = float4(xe_x, xe_pixel.y, 0.0f, 0.0f);\n",
                         register_count - 1);

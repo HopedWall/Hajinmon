@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string_view>
 #include <vector>
@@ -99,6 +100,10 @@ class PlumeRenderer {
   // blue swapped) or black. Returns whether something was presented.
   bool EndFrame(TrackedTexture* source, uint32_t width, uint32_t height, bool swap_red_blue);
 
+  // Saves the next presented frame as a PNG in ScreenshotDirectory(). Thread-safe.
+  void RequestScreenshot();
+  static std::filesystem::path ScreenshotDirectory();
+
   // Compiles a built-in HLSL shader for the current backend.
   std::unique_ptr<plume::RenderShader> CompileBuiltinShader(const char* hlsl,
                                                             ShaderCompiler::Stage stage);
@@ -153,6 +158,7 @@ class PlumeRenderer {
   std::unique_ptr<plume::RenderBuffer> capture_buffer_;
   uint64_t capture_buffer_size_ = 0;
 
+  std::atomic<bool> screenshot_requested_{false};
   std::atomic<void*> pending_window_{nullptr};
   void* window_ = nullptr;
 };
