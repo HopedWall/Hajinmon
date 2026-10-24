@@ -8,9 +8,11 @@
 // texture is then used directly when the game samples or presents that
 // address, without going through guest memory.
 //
+// Surfaces the game renders with MSAA are multisampled on the host too
+// (plume_msaa samples, at least the game's), resolved by averaging.
+//
 // Not handled yet: EDRAM aliasing between surfaces of different formats or
-// bases, MSAA (surfaces are rendered at one sample per pixel), resolve format
-// conversion and depth resolves.
+// bases, resolve format conversion and resolves of a single sample.
 
 #pragma once
 
@@ -46,6 +48,7 @@ class RenderTargetCache {
     plume::RenderFramebuffer* framebuffer = nullptr;
     uint32_t width = 0;
     uint32_t height = 0;
+    uint32_t samples = 1;
   };
   // Finds or creates the render targets of the current draw: color targets
   // 0...color_count - 1 (as the pixel shader writes them), and depth/stencil if
@@ -77,6 +80,8 @@ class RenderTargetCache {
   TrackedTexture* GetRenderTarget(uint32_t base_tiles, uint32_t format, bool is_depth,
                                   uint32_t pitch, rex::graphics::xenos::MsaaSamples msaa,
                                   uint32_t min_height);
+  // Host samples per pixel for a guest MSAA mode.
+  uint32_t GetHostSampleCount(rex::graphics::xenos::MsaaSamples msaa, plume::RenderFormat format);
   plume::RenderFramebuffer* GetFramebuffer(TrackedTexture* const* colors, uint32_t color_count,
                                            TrackedTexture* depth);
   // Drops (after the frame) the framebuffers using a texture about to be replaced.
@@ -99,7 +104,8 @@ class RenderTargetCache {
   uint64_t resolve_version_ = 0;
 
   std::unique_ptr<plume::RenderPipelineLayout> depth_copy_layout_;
-  std::unique_ptr<plume::RenderPipeline> depth_copy_pipeline_;
+  // Without and with MSAA on the source.
+  std::unique_ptr<plume::RenderPipeline> depth_copy_pipelines_[2];
   std::unique_ptr<plume::RenderDescriptorSet>
       depth_copy_sets_[PlumeRenderer::kFramesInFlight][kMaxDepthCopiesPerFrame];
   uint64_t depth_copy_frame_ = UINT64_MAX;

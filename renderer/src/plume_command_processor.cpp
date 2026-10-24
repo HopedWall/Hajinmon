@@ -352,6 +352,9 @@ bool PlumeCommandProcessor::Draw() {
     description.blend_control[i] = regs.values[reg::RB_BLENDCONTROL::rt_register_indices[i]];
   }
   description.has_depth = targets.depth != nullptr;
+  description.sample_count = targets.samples;
+  // Alpha to coverage (alpha to mask), with MSAA only.
+  description.alpha_to_coverage = targets.samples > 1 && color_control.alpha_to_mask_enable;
   description.color_mask = color_mask;
   description.depth_control = depth_control.value;
   description.stencil_ref_mask = regs.values[rex::graphics::XE_GPU_REG_RB_STENCILREFMASK];

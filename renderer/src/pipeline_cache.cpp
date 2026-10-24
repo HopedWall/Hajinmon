@@ -163,7 +163,8 @@ plume::RenderPipeline* PipelineCache::GetPipeline(const Description& d,
       uint64_t(d.blend_control[0]) | (uint64_t(d.blend_control[1]) << 32),
       uint64_t(d.blend_control[2]) | (uint64_t(d.blend_control[3]) << 32),
       uint64_t(d.depth_control) | (uint64_t(d.stencil_ref_mask) << 32),
-      uint64_t(d.stencil_ref_mask_bf),
+      uint64_t(d.stencil_ref_mask_bf) | (uint64_t(d.sample_count) << 32) |
+          (uint64_t(d.alpha_to_coverage) << 40),
   };
   uint64_t key = XXH3_64bits(fields, sizeof(fields));
   auto it = pipelines_.find(key);
@@ -197,6 +198,8 @@ plume::RenderPipeline* PipelineCache::GetPipeline(const Description& d,
       break;
   }
 
+  desc.multisampling.sampleCount = d.sample_count;
+  desc.alphaToCoverageEnabled = d.alpha_to_coverage;
   desc.renderTargetCount = d.color_count;
   for (uint32_t i = 0; i < d.color_count; ++i) {
     desc.renderTargetFormat[i] = d.color_formats[i];

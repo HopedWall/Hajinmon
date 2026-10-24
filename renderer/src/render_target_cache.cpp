@@ -5,10 +5,16 @@
 #include <algorithm>
 
 #include <fmt/format.h>
+#include <rex/cvar.h>
 #include <rex/logging/macros.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/math.h>
+
+REXCVAR_DEFINE_INT32(plume_msaa, 4, "GPU/Plume",
+                     "Samples per pixel of the surfaces the game renders with MSAA (2, 4 or 8; "
+                     "at least what the game uses)")
+    .range(1, 8);
 
 namespace hajinmon::renderer {
 
@@ -30,7 +36,11 @@ struct DepthCopyConstants {
   int2 source_offset;
 };
 [[vk::push_constant]] ConstantBuffer<DepthCopyConstants> depth_copy : register(b0, space1);
+#ifdef MULTISAMPLED
+Texture2DMS<float> depth_source : register(t0, space0);
+#else
 Texture2D<float> depth_source : register(t0, space0);
+#endif
 
 #ifdef VERTEX
 float4 main(uint vertex_id : SV_VertexID) : SV_Position {
@@ -39,7 +49,12 @@ float4 main(uint vertex_id : SV_VertexID) : SV_Position {
 }
 #else
 float main(float4 position : SV_Position) : SV_Target0 {
+#ifdef MULTISAMPLED
+  // The first sample, like a Xenos resolve of sample 0.
+  return depth_source.Load(int2(position.xy) + depth_copy.source_offset, 0);
+#else
   return depth_source.Load(int3(int2(position.xy) + depth_copy.source_offset, 0));
+#endif
 }
 #endif
 )";
@@ -95,12 +110,28 @@ plume::RenderFormat RenderTargetCache::GetHostColorFormat(xenos::ColorRenderTarg
   }
 }
 
+uint32_t RenderTargetCache::GetHostSampleCount(xenos::MsaaSamples msaa, plume::RenderFormat format) {
+  uint32_t samples = msaa >= xenos::MsaaSamples::k4X ? 4 : msaa >= xenos::MsaaSamples::k2X ? 2 : 1;
+  // Surfaces the game renders with MSAA can use more samples.
+  if (samples > 1) {
+    samples = std::max(samples, uint32_t(std::clamp(REXCVAR_GET(plume_msaa), 1, 8)));
+  }
+  plume::RenderSampleCounts supported = renderer_.device()->getSampleCountsSupported(format);
+  while (samples > 1 && !(supported & samples)) {
+    samples >>= 1;
+  }
+  return samples;
+}
+
 TrackedTexture* RenderTargetCache::GetRenderTarget(uint32_t base_tiles, uint32_t format,
                                                    bool is_depth, uint32_t pitch,
                                                    xenos::MsaaSamples msaa, uint32_t min_height) {
-  (void)msaa;
+  plume::RenderFormat host_format =
+      is_depth ? kDepthFormat : GetHostColorFormat(xenos::ColorRenderTargetFormat(format));
+  uint32_t samples = GetHostSampleCount(msaa, host_format);
   uint64_t key = uint64_t(base_tiles & 0xFFF) | (uint64_t(format & 0xF) << 12) |
-                 (uint64_t(is_depth) << 16) | (uint64_t(pitch & 0x3FFF) << 17);
+                 (uint64_t(is_depth) << 16) | (uint64_t(pitch & 0x3FFF) << 17) |
+                 (uint64_t(samples) << 31);
   min_height = std::min(min_height, kMaxRenderTargetHeight);
   std::unique_ptr<TrackedTexture>& target = render_targets_[key];
   if (target && target->height >= min_height * scale_) {
@@ -118,15 +149,15 @@ TrackedTexture* RenderTargetCache::GetRenderTarget(uint32_t base_tiles, uint32_t
   target = std::make_unique<TrackedTexture>();
   target->width = std::clamp(pitch, 1u, 8192u) * scale_;
   target->height = height * scale_;
-  if (is_depth) {
-    target->format = kDepthFormat;
-    target->texture = renderer_.device()->createTexture(
-        plume::RenderTextureDesc::DepthTarget(target->width, target->height, target->format));
-  } else {
-    target->format = GetHostColorFormat(xenos::ColorRenderTargetFormat(format));
-    target->texture = renderer_.device()->createTexture(
-        plume::RenderTextureDesc::ColorTarget(target->width, target->height, target->format));
-  }
+  target->format = host_format;
+  target->samples = samples;
+  plume::RenderMultisampling multisampling;
+  multisampling.sampleCount = samples;
+  target->texture = renderer_.device()->createTexture(
+      is_depth ? plume::RenderTextureDesc::DepthTarget(target->width, target->height, host_format,
+                                                       multisampling)
+               : plume::RenderTextureDesc::ColorTarget(target->width, target->height, host_format,
+                                                       multisampling));
   if (!target->texture) {
     target.reset();
     return nullptr;
@@ -150,21 +181,33 @@ bool RenderTargetCache::Initialize() {
       set = device->createDescriptorSet(set_desc);
     }
   }
-  auto vertex_shader = renderer_.CompileBuiltinShader(kDepthCopyShaders, ShaderCompiler::Stage::kVertex);
-  auto pixel_shader = renderer_.CompileBuiltinShader(kDepthCopyShaders, ShaderCompiler::Stage::kPixel);
-  if (!depth_copy_layout_ || !vertex_shader || !pixel_shader) {
+  if (!depth_copy_layout_) {
     return false;
   }
-  plume::RenderGraphicsPipelineDesc desc;
-  desc.pipelineLayout = depth_copy_layout_.get();
-  desc.vertexShader = vertex_shader.get();
-  desc.pixelShader = pixel_shader.get();
-  desc.renderTargetFormat[0] = kResolvedDepthFormat;
-  desc.renderTargetBlend[0] = plume::RenderBlendDesc::Copy();
-  desc.renderTargetCount = 1;
-  desc.primitiveTopology = plume::RenderPrimitiveTopology::TRIANGLE_LIST;
-  depth_copy_pipeline_ = device->createGraphicsPipeline(desc);
-  return depth_copy_pipeline_ != nullptr;
+  // Without and with MSAA on the source.
+  for (uint32_t multisampled = 0; multisampled < 2; ++multisampled) {
+    std::string source =
+        std::string(multisampled ? "#define MULTISAMPLED 1\n" : "") + kDepthCopyShaders;
+    auto vertex_shader =
+        renderer_.CompileBuiltinShader(source.c_str(), ShaderCompiler::Stage::kVertex);
+    auto pixel_shader = renderer_.CompileBuiltinShader(source.c_str(), ShaderCompiler::Stage::kPixel);
+    if (!vertex_shader || !pixel_shader) {
+      return false;
+    }
+    plume::RenderGraphicsPipelineDesc desc;
+    desc.pipelineLayout = depth_copy_layout_.get();
+    desc.vertexShader = vertex_shader.get();
+    desc.pixelShader = pixel_shader.get();
+    desc.renderTargetFormat[0] = kResolvedDepthFormat;
+    desc.renderTargetBlend[0] = plume::RenderBlendDesc::Copy();
+    desc.renderTargetCount = 1;
+    desc.primitiveTopology = plume::RenderPrimitiveTopology::TRIANGLE_LIST;
+    depth_copy_pipelines_[multisampled] = device->createGraphicsPipeline(desc);
+    if (!depth_copy_pipelines_[multisampled]) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void RenderTargetCache::ForgetFramebuffers(TrackedTexture* texture) {
@@ -208,7 +251,7 @@ void RenderTargetCache::CopyDepth(TrackedTexture& source, const plume::RenderRec
   int32_t width = source_rect.right - source_rect.left, height = source_rect.bottom - source_rect.top;
   list->setViewports(plume::RenderViewport(float(dest_x), float(dest_y), float(width), float(height)));
   list->setScissors(plume::RenderRect(dest_x, dest_y, dest_x + width, dest_y + height));
-  list->setPipeline(depth_copy_pipeline_.get());
+  list->setPipeline(depth_copy_pipelines_[source.samples > 1 ? 1 : 0].get());
   list->setGraphicsPipelineLayout(depth_copy_layout_.get());
   list->setGraphicsDescriptorSet(set, 0);
   int32_t offset[2] = {source_rect.left - dest_x, source_rect.top - dest_y};
@@ -277,6 +320,8 @@ bool RenderTargetCache::Update(const rex::graphics::RegisterFile& regs, uint32_t
   }
   binding_out.framebuffer =
       GetFramebuffer(binding_out.color, binding_out.color_count, binding_out.depth);
+  binding_out.samples =
+      binding_out.color_count ? binding_out.color[0]->samples : binding_out.depth->samples;
   // The area all bound targets cover.
   binding_out.width = binding_out.height = UINT32_MAX;
   for (uint32_t i = 0; i < binding_out.color_count; ++i) {
@@ -414,13 +459,21 @@ void RenderTargetCache::Resolve(const rex::graphics::RegisterFile& regs, const R
         if (is_depth) {
           CopyDepth(*source, host_rect, resolved->texture, host_dest_x, host_dest_y);
         } else {
-          source->Transition(list, plume::RenderTextureLayout::COPY_SOURCE);
-          resolved->texture.Transition(list, plume::RenderTextureLayout::COPY_DEST);
-          plume::RenderBox box(host_rect.left, host_rect.top, host_rect.right, host_rect.bottom);
-          list->copyTextureRegion(
-              plume::RenderTextureCopyLocation::Subresource(resolved->texture.texture.get()),
-              plume::RenderTextureCopyLocation::Subresource(source->texture.get()),
-              uint32_t(host_dest_x), uint32_t(host_dest_y), 0, &box);
+          if (source->samples > 1) {
+            // Averages the samples, as the Xenos resolve does by default.
+            source->Transition(list, plume::RenderTextureLayout::RESOLVE_SOURCE);
+            resolved->texture.Transition(list, plume::RenderTextureLayout::RESOLVE_DEST);
+            list->resolveTextureRegion(resolved->texture.texture.get(), uint32_t(host_dest_x),
+                                       uint32_t(host_dest_y), source->texture.get(), &host_rect);
+          } else {
+            source->Transition(list, plume::RenderTextureLayout::COPY_SOURCE);
+            resolved->texture.Transition(list, plume::RenderTextureLayout::COPY_DEST);
+            plume::RenderBox box(host_rect.left, host_rect.top, host_rect.right, host_rect.bottom);
+            list->copyTextureRegion(
+                plume::RenderTextureCopyLocation::Subresource(resolved->texture.texture.get()),
+                plume::RenderTextureCopyLocation::Subresource(source->texture.get()),
+                uint32_t(host_dest_x), uint32_t(host_dest_y), 0, &box);
+          }
         }
       }
     }

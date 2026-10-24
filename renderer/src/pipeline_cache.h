@@ -44,6 +44,8 @@ class PipelineCache {
     uint32_t stencil_ref_mask;
     uint32_t stencil_ref_mask_bf;
     uint32_t cull_mode;
+    uint32_t sample_count;
+    bool alpha_to_coverage;
   };
   // Returns null if the pipeline can't be created.
   plume::RenderPipeline* GetPipeline(const Description& description,

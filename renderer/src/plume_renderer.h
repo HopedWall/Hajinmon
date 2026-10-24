@@ -30,6 +30,7 @@ struct TrackedTexture {
   plume::RenderFormat format = plume::RenderFormat::UNKNOWN;
   uint32_t width = 0;
   uint32_t height = 0;
+  uint32_t samples = 1;
 
   void Transition(plume::RenderCommandList* command_list, plume::RenderTextureLayout new_layout) {
     if (layout != new_layout) {
