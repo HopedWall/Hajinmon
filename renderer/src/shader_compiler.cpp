@@ -8,6 +8,8 @@
 #include <objidl.h>
 #else
 #include <dlfcn.h>
+
+#include <filesystem>
 #endif
 
 #include <dxcapi.h>
@@ -43,7 +45,13 @@ bool ShaderCompiler::Initialize() {
                               GetProcAddress(library, "DxcCreateInstance"))
                         : nullptr;
 #else
-  void* library = dlopen("libdxcompiler.so", RTLD_NOW | RTLD_LOCAL);
+  // Next to the executable, as on Windows.
+  std::error_code error;
+  std::filesystem::path directory = std::filesystem::read_symlink("/proc/self/exe", error).parent_path();
+  void* library = dlopen((directory / "libdxcompiler.so").c_str(), RTLD_NOW | RTLD_LOCAL);
+  if (!library) {
+    library = dlopen("libdxcompiler.so", RTLD_NOW | RTLD_LOCAL);
+  }
   auto create = library ? reinterpret_cast<DxcCreateInstanceProc>(dlsym(library, "DxcCreateInstance"))
                         : nullptr;
 #endif

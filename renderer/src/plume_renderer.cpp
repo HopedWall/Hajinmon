@@ -17,6 +17,10 @@
 #include <rex/cvar.h>
 #include <rex/logging/macros.h>
 
+#if defined(__linux__)
+#include <SDL3/SDL.h>
+#endif
+
 REXCVAR_DEFINE_STRING(plume_backend, "auto", "GPU/Plume",
                       "Graphics API of the native renderer: auto, d3d12, vulkan")
     .allowed({"auto", "d3d12", "vulkan"})
@@ -81,6 +85,29 @@ float4 main(VertexOutput input) : SV_Target0 {
 }
 #endif
 )";
+
+#if defined(_WIN32)
+bool ToRenderWindow(void* window, plume::RenderWindow& render_window) {
+  render_window = static_cast<HWND>(window);
+  return true;
+}
+#else
+// Plume presents to an X11 window: the game's SDL window under X11 (or XWayland).
+bool ToRenderWindow(void* window, plume::RenderWindow& render_window) {
+  SDL_PropertiesID properties = SDL_GetWindowProperties(static_cast<SDL_Window*>(window));
+  render_window.display = static_cast<Display*>(
+      SDL_GetPointerProperty(properties, SDL_PROP_WINDOW_X11_DISPLAY_POINTER, nullptr));
+  render_window.window =
+      static_cast<Window>(SDL_GetNumberProperty(properties, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0));
+  if (!render_window.display || !render_window.window) {
+    const char* driver = SDL_GetCurrentVideoDriver();
+    REXLOG_ERROR("Plume: the window is not an X11 window (SDL video driver: {}), set SDL_VIDEO_DRIVER=x11",
+                 driver ? driver : "none");
+    return false;
+  }
+  return true;
+}
+#endif
 
 }  // namespace
 
@@ -236,8 +263,13 @@ bool PlumeRenderer::EnsureSwapChain() {
     window_ = window;
   }
   if (!swap_chain_) {
-    swap_chain_ = queue_->createSwapChain(plume::RenderSwapChainDesc(
-        static_cast<plume::RenderWindow>(window_), kSwapChainFormat, kSwapChainImages));
+    plume::RenderWindow render_window{};
+    if (!ToRenderWindow(window_, render_window)) {
+      pending_window_.store(nullptr);
+      return false;
+    }
+    swap_chain_ = queue_->createSwapChain(
+        plume::RenderSwapChainDesc(render_window, kSwapChainFormat, kSwapChainImages));
     if (!swap_chain_) {
       REXLOG_ERROR("Plume: could not create the swap chain");
       return false;

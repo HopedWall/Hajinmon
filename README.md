@@ -19,9 +19,10 @@ runtime.
 - 60 FPS on a dedicated GPU, rendered at 2x (2560x1440) and shown in a
   1920x1080 window by default.
 - Two renderers: Direct3D 12 (default) and Vulkan.
-- Experimental native renderer (Plume, Windows): draws the game with its
-  shaders translated to HLSL instead of emulating the Xbox 360 GPU, with MSAA.
-  Opt-in, in the launcher's *Graphics* tab (see [Native renderer](#native-renderer)).
+- Experimental native renderer (Plume): draws the game with its shaders
+  translated to HLSL instead of emulating the Xbox 360 GPU, with MSAA. Opt-in,
+  in the launcher's *Graphics* tab on Windows and with `--renderer=plume` on
+  Linux (see [Native renderer](#native-renderer)).
 - Xbox controllers and keyboard/mouse work out of the box.
 - Not everything has been tested yet. See [Troubleshooting](#troubleshooting)
   for how to collect information about crashes and graphical issues.
@@ -128,7 +129,8 @@ tools\setup_plume.cmd
 This clones [Plume](https://github.com/renderbag/plume) (the graphics library
 of the native renderer) into `external\plume` and the
 [DXC binaries](https://github.com/renderbag/dxc-bin) (the shader compiler) into
-`external\dxc-bin`, at pinned commits. To build without the native renderer,
+`external\dxc-bin`, at pinned commits (`tools/setup_plume.sh` on Linux). To
+build without the native renderer,
 configure the game with `-DHAJINMON_PLUME_RENDERER=OFF` instead.
 
 #### 5. Build the game
@@ -291,13 +293,16 @@ native renderer built on [Plume](https://github.com/renderbag/plume). The
 game's shader microcode is translated to HLSL and compiled with DXC on
 background threads; the compiled shaders are cached in the user data folder
 (`cache\plume`), and the shaders seen in earlier sessions are compiled again at
-startup, so the first time a new shader appears is the only stall. It is
-Windows-only for now and has only been tested on Direct3D 12.
+startup, so the first time a new shader appears is the only stall. It uses
+Direct3D 12 on Windows and Vulkan on Linux, where it presents to an X11 window
+(XWayland on Wayland desktops; the AppImage sets `SDL_VIDEO_DRIVER=x11` with
+`--renderer=plume`). Vulkan has been tested on Linux with a software driver
+only.
 
 | Option | Description |
 |---|---|
 | `--renderer=plume` | Use the native renderer (`xenia`, the default, is the emulated GPU). |
-| `--plume_backend=d3d12` | Graphics API: `auto`, `d3d12` or `vulkan` (untested). |
+| `--plume_backend=d3d12` | Graphics API: `auto`, `d3d12` or `vulkan` (Windows only; Linux always uses Vulkan). |
 | `--plume_resolution_scale=N` | Internal resolution multiplier, 1-4 (default 2). |
 | `--plume_msaa=N` | Samples per pixel (2, 4 or 8, default 4) of the surfaces the game renders with MSAA. |
 | `--plume_anisotropic=N` | Texture filtering: `-1` game default, `0` off, `2`-`5` = 2x/4x/8x/16x. |

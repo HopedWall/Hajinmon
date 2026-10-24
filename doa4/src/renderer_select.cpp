@@ -11,6 +11,9 @@
 
 #if HAJINMON_PLUME_RENDERER
 #include "plume_graphics_system.h"
+#if !defined(_WIN32)
+#include <SDL3/SDL.h>
+#endif
 #endif
 
 REXCVAR_DEFINE_STRING(renderer, "xenia", "GPU",
@@ -36,7 +39,20 @@ void AttachWindowToRenderer(rex::system::IGraphicsSystem* graphics, rex::ui::Win
 #if HAJINMON_PLUME_RENDERER
   auto* plume = dynamic_cast<hajinmon::renderer::PlumeGraphicsSystem*>(graphics);
   if (plume && window) {
+#if defined(_WIN32)
     plume->AttachWindow(window->GetNativeWindowHandle());
+#else
+    // The SDK gives no native handle outside Windows: the renderer takes the
+    // game's SDL window (its only window) and finds the X11 window from it.
+    int count = 0;
+    SDL_Window** windows = SDL_GetWindows(&count);
+    if (windows && count > 0) {
+      plume->AttachWindow(windows[0]);
+    } else {
+      REXLOG_ERROR("doa4: no SDL window for the native renderer");
+    }
+    SDL_free(windows);
+#endif
     // The SDK's F3 debug overlay needs its presenter, which the native renderer
     // replaces: F3 takes screenshots instead.
     rex::ui::UnregisterBind("bind_debug_overlay");

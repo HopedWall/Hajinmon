@@ -56,7 +56,7 @@ class PlumeRenderer {
   bool Initialize();
   void Shutdown();
 
-  // Window to present to (an HWND on Windows). Called from the UI thread once
+  // Window to present to (an HWND on Windows, an SDL_Window elsewhere). Called from the UI thread once
   // the window exists; the swap chain is created on the next frame.
   void AttachWindow(void* native_window);
 

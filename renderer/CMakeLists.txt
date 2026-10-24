@@ -11,10 +11,10 @@ set(HAJINMON_DXC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../external/dxc-bin"
     CACHE PATH "DXC binaries (https://github.com/renderbag/dxc-bin, tools/setup_plume.cmd)")
 
 if(NOT EXISTS "${HAJINMON_PLUME_DIR}/CMakeLists.txt")
-    message(FATAL_ERROR "Plume not found in ${HAJINMON_PLUME_DIR}: run tools\\setup_plume.cmd")
+    message(FATAL_ERROR "Plume not found in ${HAJINMON_PLUME_DIR}: run tools\\setup_plume.cmd (Windows) or tools/setup_plume.sh (Linux)")
 endif()
 if(NOT EXISTS "${HAJINMON_DXC_DIR}/inc/dxcapi.h")
-    message(FATAL_ERROR "DXC not found in ${HAJINMON_DXC_DIR}: run tools\\setup_plume.cmd")
+    message(FATAL_ERROR "DXC not found in ${HAJINMON_DXC_DIR}: run tools\\setup_plume.cmd (Windows) or tools/setup_plume.sh (Linux)")
 endif()
 add_subdirectory("${HAJINMON_PLUME_DIR}" plume EXCLUDE_FROM_ALL)
 
@@ -68,6 +68,12 @@ target_link_libraries(hajinmon_plume
 if(WIN32)
     # Plume's Direct3D 12 backend (without the Agility SDK) uses the system libraries.
     target_link_libraries(hajinmon_plume PUBLIC d3d12 dxgi dxguid)
+else()
+    # Plume's Vulkan backend presents to X11 windows (Xlib), dlopen loads DXC.
+    find_package(X11 REQUIRED)
+    target_link_libraries(hajinmon_plume PUBLIC X11::X11 ${CMAKE_DL_LIBS})
+    # dxcapi.h: COM interface IDs without the MSVC __declspec(uuid) extension.
+    target_compile_definitions(hajinmon_plume PUBLIC __EMULATE_UUID)
 endif()
 
 # DXC compiles the translated shaders at run time; it is loaded from the

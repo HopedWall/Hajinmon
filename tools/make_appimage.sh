@@ -58,6 +58,11 @@ cp "$ROOT/LICENSE" "$APPDIR/usr/share/doc/hajinmon/LICENSE"
 cp "$SDK_SRC/LICENSE" "$APPDIR/usr/share/doc/hajinmon/LICENSE-rexglue-sdk"
 python3 "$ROOT/tools/third_party_notices.py" "$SDK_SRC" \
     "$APPDIR/usr/share/doc/hajinmon/THIRD_PARTY_NOTICES.txt"
+# The native Plume renderer and its shader compiler, in builds that have them.
+if [ -f "$BUILD/libdxcompiler.so" ]; then
+    cp "$ROOT/external/plume/LICENSE" "$APPDIR/usr/share/doc/hajinmon/LICENSE-plume"
+    cp "$ROOT/renderer/LICENSE-dxc.txt" "$APPDIR/usr/share/doc/hajinmon/LICENSE-dxc"
+fi
 
 echo "[2/4] Writing the launcher script..."
 cat > "$APPDIR/AppRun" <<'EOF'
@@ -65,7 +70,8 @@ cat > "$APPDIR/AppRun" <<'EOF'
 # Starts Hajinmon. Arguments:
 #   <path>          the Dead or Alive 4 .iso (or extracted game folder) to use
 #   --change-game   ask again for the game
-#   --<option>=...  passed to the game (e.g. --resolution_scale=2, --no-fullscreen)
+#   --<option>=...  passed to the game (e.g. --resolution_scale=2, --no-fullscreen,
+#                   --renderer=plume for the experimental native renderer)
 HERE="$(dirname "$(readlink -f "$0")")"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/Hajinmon"
 GAME_FILE="$CONFIG_DIR/game_path"
@@ -76,6 +82,8 @@ options=()
 for arg in "$@"; do
     case "$arg" in
         --change-game) rm -f "$GAME_FILE" ;;
+        # The native renderer presents to X11 windows (XWayland on Wayland desktops).
+        --renderer=plume) options+=("$arg"); export SDL_VIDEO_DRIVER="${SDL_VIDEO_DRIVER:-x11}" ;;
         --*) options+=("$arg") ;;
         *) game="$arg" ;;
     esac
