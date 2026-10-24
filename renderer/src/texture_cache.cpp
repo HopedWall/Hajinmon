@@ -230,9 +230,11 @@ bool TextureCache::Initialize() {
 
 void TextureCache::Shutdown() {
   for (auto& [key, texture] : textures_) {
-    if (texture->watch) {
-      shared_memory_.UnwatchMemoryRange(texture->watch);
-      texture->watch = nullptr;
+    for (void*& watch : texture->watches) {
+      if (watch) {
+        shared_memory_.UnwatchMemoryRange(watch);
+        watch = nullptr;
+      }
     }
   }
   textures_.clear();
@@ -251,11 +253,10 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& l
                                  void* data, uint64_t argument, bool invalidated_by_gpu) {
   (void)lock;
   (void)context;
-  (void)argument;
   (void)invalidated_by_gpu;
   auto* texture = static_cast<Texture*>(data);
   // The watch is cancelled after the callback.
-  texture->watch = nullptr;
+  texture->watches[argument] = nullptr;
   texture->dirty = true;
 }
 
@@ -297,6 +298,9 @@ uint32_t TextureCache::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
                                                                     : plume::RenderFilter::LINEAR;
   desc.mipmapMode = fetch.mip_filter == xenos::TextureFilter::kLinear ? plume::RenderMipmapMode::LINEAR
                                                                       : plume::RenderMipmapMode::NEAREST;
+  if (fetch.mip_filter == xenos::TextureFilter::kBaseMap) {
+    desc.maxLOD = 0.0f;
+  }
   uint32_t aniso = uint32_t(fetch.aniso_filter);
   if (aniso > uint32_t(xenos::AnisoFilter::kMax_1_1) && aniso <= uint32_t(xenos::AnisoFilter::kMax_16_1)) {
     desc.anisotropyEnabled = true;
@@ -372,92 +376,159 @@ bool TextureCache::Load(Texture& texture, const xenos::xe_gpu_texture_fetch_t& f
   texture_util::GetSubresourcesFromFetchConstant(fetch, &width_minus_1, &height_minus_1,
                                                  &depth_minus_1, &base_page, &mip_page, &mip_min,
                                                  &mip_max);
-  if (!base_page) {
-    return false;
-  }
-  uint32_t width = width_minus_1 + 1, height = height_minus_1 + 1;
   auto dimension = xenos::DataDimension(fetch.dimension);
-  texture_util::TextureGuestLayout layout = texture_util::GetGuestTextureLayout(
-      dimension, fetch.pitch, width, height, 1, fetch.tiled, format, fetch.packed_mips, true, 0);
-  uint32_t base_address = base_page << 12;
-  uint32_t extent = std::max(layout.base.level_data_extent_bytes, 4u);
-  if (uint64_t(base_address) + extent > PlumeSharedMemory::kBufferSize) {
+  if (!base_page || (dimension == xenos::DataDimension::k2DOrStacked && depth_minus_1)) {
+    // Stacked (array) textures are not supported yet.
     return false;
   }
-
-  // Watch for CPU writes to reload the texture.
-  if (texture.watch) {
-    shared_memory_.UnwatchMemoryRange(texture.watch);
-    texture.watch = nullptr;
-  }
-  texture.dirty = false;
-  shared_memory_.RequestRange(base_address, extent);
-  texture.watch =
-      shared_memory_.WatchMemoryRange(base_address, extent, WatchCallback, this, &texture, 0);
-
-  // Copy and endian-swap the memory, in memory order.
-  std::vector<uint8_t> guest(rex::align(extent, 4u));
-  std::memcpy(guest.data(), memory_.TranslatePhysical<const uint8_t*>(base_address), extent);
-  SwapDwords(guest.data(), guest.size(), xenos::Endian(fetch.endianness));
-
+  bool is_3d = dimension == xenos::DataDimension::k3D;
+  bool is_cube = dimension == xenos::DataDimension::kCube;
+  uint32_t width = width_minus_1 + 1, height = height_minus_1 + 1;
+  uint32_t depth = is_3d ? depth_minus_1 + 1 : 1;
+  uint32_t array_size = is_cube ? 6 : 1;
   uint32_t block_width = info->block_width, block_height = info->block_height;
-  uint32_t guest_bpb = info->bytes_per_block();
-  uint32_t bpb_log2 = guest_bpb >= 16 ? 4 : guest_bpb >= 8 ? 3 : guest_bpb >= 4 ? 2 : guest_bpb >= 2 ? 1 : 0;
-  uint32_t width_blocks = (width + block_width - 1) / block_width;
-  uint32_t height_blocks = (height + block_height - 1) / block_height;
-  uint32_t offset_x = 0, offset_y = 0, offset_z = 0;
-  if (layout.packed_level == 0) {
-    texture_util::GetPackedMipOffset(width, height, 1, format, 0, offset_x, offset_y, offset_z);
-  }
-  uint32_t row_pitch = layout.base.row_pitch_bytes;
-  uint32_t pitch_blocks = row_pitch >> bpb_log2;
 
-  // Host rows are aligned to 256 bytes for Direct3D 12.
-  uint32_t host_row = (width_blocks * host.bytes_per_block + 255) & ~255u;
-  PlumeRenderer::Allocation upload = renderer_.Upload(uint64_t(host_row) * height_blocks, 512);
-  for (uint32_t y = 0; y < height_blocks; ++y) {
-    uint8_t* dest_row = upload.data + uint64_t(host_row) * y;
-    for (uint32_t x = 0; x < width_blocks; ++x) {
-      int64_t source_offset =
-          fetch.tiled ? texture_util::GetTiledOffset2D(int32_t(x + offset_x), int32_t(y + offset_y),
-                                                       pitch_blocks, bpb_log2)
-                      : int64_t(y + offset_y) * row_pitch + int64_t(x + offset_x) * guest_bpb;
-      uint8_t* dest = dest_row + x * host.bytes_per_block;
-      if (source_offset < 0 || uint64_t(source_offset) + guest_bpb > guest.size()) {
-        std::memset(dest, 0, host.bytes_per_block);
-        continue;
+  // Mip levels: as stored, but block-compressed levels smaller than a block
+  // are left out (they can't be copied as whole blocks on the host).
+  uint32_t level_count = 1;
+  if (mip_page) {
+    while (level_count <= mip_max) {
+      uint32_t level_width = std::max(width >> level_count, 1u);
+      uint32_t level_height = std::max(height >> level_count, 1u);
+      if ((block_width > 1 && level_width < block_width) ||
+          (block_height > 1 && level_height < block_height)) {
+        break;
       }
-      ConvertBlock(host.conversion, guest.data() + source_offset, dest, guest_bpb,
-                   host.bytes_per_block);
+      ++level_count;
     }
   }
+  texture_util::TextureGuestLayout layout = texture_util::GetGuestTextureLayout(
+      dimension, fetch.pitch, width, height, is_3d ? depth : array_size, fetch.tiled, format,
+      fetch.packed_mips, true, level_count - 1);
 
-  // Block-compressed textures need host sizes in whole blocks.
-  uint32_t host_width = width_blocks * block_width, host_height = height_blocks * block_height;
+  // The memory of the base level and of the mips, endian-swapped in memory
+  // order. Watched for CPU writes to reload the texture.
+  uint32_t ranges[2][2] = {
+      {base_page << 12, std::max(layout.base.level_data_extent_bytes * array_size, 4u)},
+      {mip_page << 12, level_count > 1 ? layout.mips_total_extent_bytes : 0}};
+  std::vector<uint8_t> guest[2];
+  texture.dirty = false;
+  for (uint32_t i = 0; i < 2; ++i) {
+    if (texture.watches[i]) {
+      shared_memory_.UnwatchMemoryRange(texture.watches[i]);
+      texture.watches[i] = nullptr;
+    }
+    uint32_t address = ranges[i][0], length = ranges[i][1];
+    if (!length) {
+      continue;
+    }
+    if (uint64_t(address) + length > PlumeSharedMemory::kBufferSize) {
+      return false;
+    }
+    shared_memory_.RequestRange(address, length);
+    texture.watches[i] = shared_memory_.WatchMemoryRange(address, length, WatchCallback, this,
+                                                         &texture, i);
+    guest[i].resize(rex::align(length, 4u));
+    std::memcpy(guest[i].data(), memory_.TranslatePhysical<const uint8_t*>(address), length);
+    SwapDwords(guest[i].data(), guest[i].size(), xenos::Endian(fetch.endianness));
+  }
+
+  // Host texture: block-compressed textures need sizes in whole blocks.
+  uint32_t guest_bpb = info->bytes_per_block();
+  uint32_t bpb_log2 = guest_bpb >= 16 ? 4 : guest_bpb >= 8 ? 3 : guest_bpb >= 4 ? 2 : guest_bpb >= 2 ? 1 : 0;
+  uint32_t host_width = rex::align(width, block_width), host_height = rex::align(height, block_height);
   if (!texture.texture.texture || texture.texture.format != host.format ||
-      texture.texture.width != host_width || texture.texture.height != host_height) {
+      texture.texture.width != host_width || texture.texture.height != host_height ||
+      texture.levels != level_count || texture.depth != depth || texture.set != SetFor(dimension)) {
     renderer_.Retire(std::move(texture.texture.texture));
+    texture.view.reset();
     texture.texture = TrackedTexture();
     texture.texture.format = host.format;
     texture.texture.width = host_width;
     texture.texture.height = host_height;
-    texture.texture.texture = renderer_.device()->createTexture(
-        plume::RenderTextureDesc::Texture2D(host_width, host_height, 1, host.format));
+    texture.levels = level_count;
+    texture.depth = depth;
+    texture.set = SetFor(dimension);
+    if (is_3d) {
+      texture.texture.texture = renderer_.device()->createTexture(
+          plume::RenderTextureDesc::Texture3D(host_width, host_height, depth, level_count, host.format));
+    } else {
+      texture.texture.texture = renderer_.device()->createTexture(plume::RenderTextureDesc::Texture(
+          plume::RenderTextureDimension::TEXTURE_2D, host_width, host_height, 1, level_count,
+          array_size, host.format, is_cube ? plume::RenderTextureFlag::CUBE : plume::RenderTextureFlag::NONE));
+    }
     if (!texture.texture.texture) {
       return false;
     }
-    texture.texture.texture->setName(fmt::format("Texture {:08X}", base_address));
+    if (is_cube) {
+      texture.view = texture.texture.texture->createTextureView(
+          plume::RenderTextureViewDesc::TextureCube(host.format));
+    }
+    texture.texture.texture->setName(fmt::format("Texture {:08X}", base_page << 12));
   }
+
   plume::RenderCommandList* list = renderer_.command_list();
   texture.texture.Transition(list, plume::RenderTextureLayout::COPY_DEST);
-  list->copyTextureRegion(
-      plume::RenderTextureCopyLocation::Subresource(texture.texture.texture.get()),
-      plume::RenderTextureCopyLocation::PlacedFootprint(
-          upload.buffer, host.format, host_width, host_height, 1,
-          host_row / host.bytes_per_block * block_width, upload.offset));
+  for (uint32_t level = 0; level < level_count; ++level) {
+    // Levels from the packed one on are in the packed mip tail.
+    uint32_t stored_level = std::min(level, layout.packed_level);
+    const texture_util::TextureGuestLayout::Level& level_layout =
+        level ? layout.mips[stored_level] : layout.base;
+    const std::vector<uint8_t>& data = guest[level ? 1 : 0];
+    uint32_t level_offset = level ? layout.mip_offsets_bytes[stored_level] : 0;
+    uint32_t offset_x = 0, offset_y = 0, offset_z = 0;
+    if (level >= layout.packed_level) {
+      texture_util::GetPackedMipOffset(width, height, depth, format, level, offset_x, offset_y,
+                                       offset_z);
+    }
+    uint32_t level_width = std::max(host_width >> level, 1u);
+    uint32_t level_height = std::max(host_height >> level, 1u);
+    uint32_t level_depth = std::max(depth >> level, 1u);
+    uint32_t width_blocks = (level_width + block_width - 1) / block_width;
+    uint32_t height_blocks = (level_height + block_height - 1) / block_height;
+    uint32_t row_pitch = level_layout.row_pitch_bytes;
+    uint32_t pitch_blocks = row_pitch >> bpb_log2;
+    uint32_t slice_rows = level_layout.z_slice_stride_block_rows;
+    // Host rows are aligned to 256 bytes for Direct3D 12.
+    uint32_t host_row = (width_blocks * host.bytes_per_block + 255) & ~255u;
+    for (uint32_t slice = 0; slice < array_size; ++slice) {
+      uint64_t slice_offset = level_offset + uint64_t(slice) * level_layout.array_slice_stride_bytes;
+      PlumeRenderer::Allocation upload =
+          renderer_.Upload(uint64_t(host_row) * height_blocks * level_depth, 512);
+      for (uint32_t z = 0; z < level_depth; ++z) {
+        for (uint32_t y = 0; y < height_blocks; ++y) {
+          uint8_t* dest_row = upload.data + uint64_t(host_row) * (z * height_blocks + y);
+          for (uint32_t x = 0; x < width_blocks; ++x) {
+            int32_t sx = int32_t(x + offset_x), sy = int32_t(y + offset_y), sz = int32_t(z + offset_z);
+            int64_t source_offset;
+            if (fetch.tiled) {
+              source_offset = is_3d ? texture_util::GetTiledOffset3D(sx, sy, sz, pitch_blocks, slice_rows,
+                                                                     bpb_log2)
+                                    : texture_util::GetTiledOffset2D(sx, sy, pitch_blocks, bpb_log2);
+            } else {
+              source_offset = (int64_t(sz) * slice_rows + sy) * row_pitch + int64_t(sx) * guest_bpb;
+            }
+            source_offset += int64_t(slice_offset);
+            uint8_t* dest = dest_row + x * host.bytes_per_block;
+            if (source_offset < 0 || uint64_t(source_offset) + guest_bpb > data.size()) {
+              std::memset(dest, 0, host.bytes_per_block);
+              continue;
+            }
+            ConvertBlock(host.conversion, data.data() + source_offset, dest, guest_bpb,
+                         host.bytes_per_block);
+          }
+        }
+      }
+      list->copyTextureRegion(
+          plume::RenderTextureCopyLocation::Subresource(texture.texture.texture.get(), level, slice),
+          plume::RenderTextureCopyLocation::PlacedFootprint(
+              upload.buffer, host.format, width_blocks * block_width, height_blocks * block_height,
+              level_depth, host_row / host.bytes_per_block * block_width, upload.offset));
+    }
+  }
   texture.texture.Transition(list, plume::RenderTextureLayout::SHADER_READ);
-  sets_[kSet2D]->setTexture(texture.index, texture.texture.texture.get(),
-                            plume::RenderTextureLayout::SHADER_READ);
+  sets_[texture.set]->setTexture(texture.index, texture.texture.texture.get(),
+                                 plume::RenderTextureLayout::SHADER_READ, texture.view.get());
   texture.swizzle = ComposeSwizzle(fetch.swizzle, host);
   texture.loaded = true;
   texture.resolve_version = 0;
@@ -472,16 +543,26 @@ void TextureCache::Bind(const xenos::xe_gpu_texture_fetch_t& fetch,
   // The black placeholder by default: (0, 0, 0, 1).
   binding_out = sampler << 20;
   swizzle_out = 4 | (4 << 3) | (4 << 6) | (5 << 9);
-  if (fetch.type != xenos::FetchConstantType::kTexture ||
-      dimension == xenos::FetchOpDimension::k3DOrStacked ||
-      dimension == xenos::FetchOpDimension::kCube ||
-      xenos::DataDimension(fetch.dimension) == xenos::DataDimension::k3D ||
-      xenos::DataDimension(fetch.dimension) == xenos::DataDimension::kCube) {
+  // The fetch instruction and the texture must agree on the dimension (the
+  // shaders declare the array to sample by the instruction's).
+  auto data_dimension = xenos::DataDimension(fetch.dimension);
+  bool dimension_matches;
+  switch (dimension) {
+    case xenos::FetchOpDimension::kCube:
+      dimension_matches = data_dimension == xenos::DataDimension::kCube;
+      break;
+    case xenos::FetchOpDimension::k3DOrStacked:
+      dimension_matches = data_dimension == xenos::DataDimension::k3D;
+      break;
+    default:
+      dimension_matches = data_dimension == xenos::DataDimension::k1D ||
+                          data_dimension == xenos::DataDimension::k2DOrStacked;
+      break;
+  }
+  if (fetch.type != xenos::FetchConstantType::kTexture || !dimension_matches) {
     ++placeholders_[fetch.type != xenos::FetchConstantType::kTexture ? 0
-                    : (dimension == xenos::FetchOpDimension::kCube ||
-                       xenos::DataDimension(fetch.dimension) == xenos::DataDimension::kCube)
-                        ? 2
-                        : 1];
+                    : dimension == xenos::FetchOpDimension::kCube    ? 2
+                                                                     : 1];
     return;
   }
   Texture* texture = GetTexture(fetch);
@@ -499,7 +580,9 @@ void TextureCache::Bind(const xenos::xe_gpu_texture_fetch_t& fetch,
   uint32_t width = width_minus_1 + 1, height = height_minus_1 + 1;
   // Resolved textures are at the resolution scale.
   uint32_t scale = render_target_cache_.scale();
-  if (resolved && resolved->guest_width >= width && resolved->guest_height >= height) {
+  if (resolved && data_dimension != xenos::DataDimension::k3D &&
+      data_dimension != xenos::DataDimension::kCube && resolved->guest_width >= width &&
+      resolved->guest_height >= height) {
     if (texture->resolve_version != resolved->version) {
       if (!texture->texture.texture || texture->texture.format != resolved->texture.format ||
           texture->texture.width != width * scale || texture->texture.height != height * scale) {
@@ -508,6 +591,10 @@ void TextureCache::Bind(const xenos::xe_gpu_texture_fetch_t& fetch,
         texture->texture.format = resolved->texture.format;
         texture->texture.width = width * scale;
         texture->texture.height = height * scale;
+        texture->levels = 1;
+        texture->depth = 1;
+        texture->set = kSet2D;
+        texture->view.reset();
         texture->texture.texture = renderer_.device()->createTexture(
             plume::RenderTextureDesc::Texture2D(width * scale, height * scale, 1, resolved->texture.format));
       }
@@ -518,7 +605,7 @@ void TextureCache::Bind(const xenos::xe_gpu_texture_fetch_t& fetch,
                               plume::RenderTextureCopyLocation::Subresource(resolved->texture.texture.get()),
                               0, 0, 0, &box);
       texture->texture.Transition(list, plume::RenderTextureLayout::SHADER_READ);
-      sets_[kSet2D]->setTexture(texture->index, texture->texture.texture.get(),
+      sets_[texture->set]->setTexture(texture->index, texture->texture.texture.get(),
                                 plume::RenderTextureLayout::SHADER_READ);
       texture->resolve_version = resolved->version;
       HostFormat resolved_format;
@@ -536,9 +623,11 @@ void TextureCache::Bind(const xenos::xe_gpu_texture_fetch_t& fetch,
         texture->swizzle |= 1u << 12;
       }
       texture->loaded = true;
-      if (texture->watch) {
-        shared_memory_.UnwatchMemoryRange(texture->watch);
-        texture->watch = nullptr;
+      for (void*& watch : texture->watches) {
+        if (watch) {
+          shared_memory_.UnwatchMemoryRange(watch);
+          watch = nullptr;
+        }
       }
     }
   } else if (!texture->loaded || texture->dirty || texture->resolve_version) {

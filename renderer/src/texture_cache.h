@@ -7,9 +7,9 @@
 // instead. A texture is reloaded when the CPU writes to its memory (the shared
 // memory watches its pages).
 //
-// Not handled yet: mipmaps (only the base level is loaded), 3D, stacked and
-// cube textures (a black placeholder is bound), signed and gamma formats, and
-// texture exponent bias.
+// Not handled yet: stacked (array) textures (a black placeholder is bound),
+// mixed signed and unsigned components, gamma formats, and texture exponent
+// bias.
 
 #pragma once
 
@@ -79,11 +79,22 @@ class TextureCache {
     uint32_t swizzle = 0;
     bool loaded = false;
     std::atomic<bool> dirty{false};
-    void* watch = nullptr;
+    // Watches of the base level and of the mips memory.
+    void* watches[2] = {};
+    uint32_t levels = 0;
+    uint32_t depth = 0;
+    DescriptorSet set = kSet2D;
+    // For cube maps.
+    std::unique_ptr<plume::RenderTextureView> view;
     // Version of the resolve copied into it, if it comes from one.
     uint64_t resolve_version = 0;
   };
 
+  static DescriptorSet SetFor(rex::graphics::xenos::DataDimension dimension) {
+    return dimension == rex::graphics::xenos::DataDimension::k3D     ? kSet3D
+           : dimension == rex::graphics::xenos::DataDimension::kCube ? kSetCube
+                                                                      : kSet2D;
+  }
   Texture* GetTexture(const rex::graphics::xenos::xe_gpu_texture_fetch_t& fetch);
   bool Load(Texture& texture, const rex::graphics::xenos::xe_gpu_texture_fetch_t& fetch);
   uint32_t GetSampler(const rex::graphics::xenos::xe_gpu_texture_fetch_t& fetch);
