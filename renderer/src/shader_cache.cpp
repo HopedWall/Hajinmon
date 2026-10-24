@@ -17,7 +17,7 @@ namespace hajinmon::renderer {
 namespace {
 
 // Bump when the DXC options change, as they are not part of the HLSL.
-constexpr uint64_t kCompilerOptionsVersion = 1;
+constexpr uint64_t kCompilerOptionsVersion = 2;
 
 ShaderCompiler& ThreadCompiler() {
   // DXC compiler objects are not thread-safe.
@@ -153,7 +153,7 @@ bool ShaderCache::Build(rex::graphics::Shader& shader, CompiledShader& out) {
   std::string errors;
   ShaderCompiler& compiler = ThreadCompiler();
   if (!compiler.initialized() ||
-      !compiler.Compile(std::string(hlsl.begin(), hlsl.end()), is_vertex_shader, target_,
+      !compiler.Compile(std::string(hlsl.begin(), hlsl.end()), is_vertex_shader ? ShaderCompiler::Stage::kVertex : ShaderCompiler::Stage::kPixel, target_,
                         out.binary, errors)) {
     REXLOG_ERROR("Plume: {} shader {:016X} failed to compile: {}",
                  is_vertex_shader ? "vertex" : "pixel", shader.ucode_data_hash(),

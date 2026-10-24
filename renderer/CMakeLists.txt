@@ -35,6 +35,12 @@ set(HAJINMON_SDK_GPU_SOURCES
     ${SDK_GPU}/pipeline/shader/translator.cpp
     ${SDK_GPU}/pipeline/shader/translator_disasm.cpp
     ${SDK_GPU}/util/draw.cpp
+    ${SDK_GPU}/shared_memory.cpp
+    ${SDK_GPU}/primitive_processor.cpp
+    ${SDK_GPU}/xenos.cpp
+    ${SDK_GPU}/pipeline/texture/info.cpp
+    ${SDK_GPU}/pipeline/texture/info_formats.cpp
+    ${SDK_GPU}/pipeline/texture/util.cpp
     ${SDK_GPU}/util/draw_extent_estimator.cpp
 )
 
@@ -46,6 +52,12 @@ add_library(hajinmon_plume STATIC
     src/hlsl_translator.cpp
     src/shader_compiler.cpp
     src/shader_cache.cpp
+    src/plume_shared_memory.cpp
+    src/plume_primitive_processor.cpp
+    src/render_target_cache.cpp
+    src/texture_cache.cpp
+    src/pipeline_cache.cpp
+    src/png_writer.cpp
     ${HAJINMON_SDK_GPU_SOURCES}
 )
 target_include_directories(hajinmon_plume PUBLIC src)
@@ -80,3 +92,8 @@ add_executable(hajinmon_shader_tool EXCLUDE_FROM_ALL tools/shader_tool.cpp)
 target_link_libraries(hajinmon_shader_tool PRIVATE hajinmon_plume)
 target_include_directories(hajinmon_shader_tool PRIVATE "${HAJINMON_DXC_DIR}/inc")
 set_target_properties(hajinmon_shader_tool PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+# The SDK's index conversion code uses SSSE3/SSE4.1 intrinsics, as in the SDK.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    target_compile_options(hajinmon_plume PRIVATE -msse4.1)
+endif()

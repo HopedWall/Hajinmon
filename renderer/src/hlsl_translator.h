@@ -10,13 +10,13 @@
 //
 // Resource interface, shared by all translated shaders (see kHlslPrologue in
 // the .cpp for the exact layout):
-//   b0 space0 - system constants, set by the command processor.
-//   b1 space0 - float constants of the stage (256 float4).
-//   b2 space0 - bool (256 bits) and loop (32 dwords) constants.
-//   b3 space0 - fetch constants (32 x 6 dwords).
+//   push constants (b0 space8) - byte offsets of the draw's constant blocks
+//                                (system, float, bool/loop, fetch).
 //   t0 space0 - shared memory (guest physical memory) for vertex fetches.
-//   tN/sN space1 (vertex) or space2 (pixel) - textures and samplers, one per
-//                                             entry of texture_slots().
+//   t1 space0 - constant blocks of all draws of the frame.
+//   space1/2/3 - bindless 2D, 3D and cube textures; space4 - samplers. The
+//   system constants map each entry of texture_slots() to a texture, a
+//   sampler and a swizzle.
 
 #pragma once
 
@@ -31,7 +31,10 @@ namespace hajinmon::renderer {
 
 class HlslShaderTranslator : public rex::graphics::ShaderTranslator {
  public:
-  // A texture the shader samples: register tN / sN of the stage space.
+  // A texture the shader samples, by slot in the texture binding table of the
+  // system constants.
+  static constexpr uint32_t kMaxTextureSlots = 16;
+
   struct TextureSlot {
     uint32_t fetch_constant;
     rex::graphics::xenos::FetchOpDimension dimension;

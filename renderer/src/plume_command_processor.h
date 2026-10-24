@@ -3,9 +3,9 @@
 // The SDK base class parses the GPU command stream (PM4 packets) on its own
 // thread and calls the Issue* methods for draws, resolves and frame swaps.
 //
-// Milestone 2: shaders are translated to HLSL and compiled in the background
-// as the game loads them. Nothing is drawn yet: draws and resolves are counted, and every swap
-// presents a cleared frame.
+// Milestone 3: draws are rendered with translated shaders to host render
+// targets (see render_target_cache.h), resolves copy them to textures, and the
+// texture the game swaps to is presented.
 
 #pragma once
 
@@ -13,12 +13,18 @@
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 
+#include "pipeline_cache.h"
+#include "plume_primitive_processor.h"
+#include "plume_shared_memory.h"
+#include "render_target_cache.h"
 #include "shader_cache.h"
 #include "shader_catalog.h"
+#include "texture_cache.h"
 
 namespace hajinmon::renderer {
 
@@ -48,6 +54,36 @@ class PlumeCommandProcessor : public rex::graphics::CommandProcessor {
   bool IssueCopy() override;
 
  private:
+  // Constant block kinds, deduplicated within a frame.
+  enum Block {
+    kBlockSystem,
+    kBlockVertexFloat,
+    kBlockPixelFloat,
+    kBlockBoolLoop,
+    kBlockFetch,
+    kBlockCount,
+  };
+  // Returns the offset of the block in the frame's constant memory, or
+  // UINT32_MAX if it is full.
+  uint32_t WriteBlock(Block block, const void* data, uint32_t size);
+  // Why draws are not done, for the statistics.
+  enum SkipReason {
+    kSkipNoVertexShader,
+    kSkipNoRasterization,
+    kSkipShaderNotReady,
+    kSkipPrimitive,
+    kSkipRenderTargets,
+    kSkipConstantsFull,
+    kSkipCulled,
+    kSkipPipeline,
+    kSkipIndexBuffer,
+    kSkipCount,
+  };
+  bool Skip(SkipReason reason) {
+    ++skipped_[reason];
+    return false;
+  }
+  bool Draw();
   void LogStats();
   void EnsureCatalog();
 
@@ -56,11 +92,26 @@ class PlumeCommandProcessor : public rex::graphics::CommandProcessor {
   std::unique_ptr<ShaderCache> shader_cache_;
   std::unordered_map<uint64_t, std::unique_ptr<rex::graphics::Shader>> shaders_;
 
+  std::unique_ptr<PlumeSharedMemory> shared_memory_;
+  std::unique_ptr<PlumePrimitiveProcessor> primitive_processor_;
+  std::unique_ptr<RenderTargetCache> render_target_cache_;
+  std::unique_ptr<TextureCache> texture_cache_;
+  std::unique_ptr<PipelineCache> pipeline_cache_;
+  std::unique_ptr<plume::RenderDescriptorSet> frame_sets_[PlumeRenderer::kFramesInFlight];
+
+  struct BlockState {
+    std::vector<uint8_t> data;
+    uint32_t offset = UINT32_MAX;
+  };
+  BlockState blocks_[kBlockCount];
+
   // Statistics, logged every few seconds.
   uint64_t frames_ = 0;
   uint64_t draws_ = 0;
+  uint64_t draws_done_ = 0;
   uint64_t copies_ = 0;
   uint64_t presented_ = 0;
+  uint64_t skipped_[kSkipCount] = {};
   std::chrono::steady_clock::time_point stats_start_;
 };
 

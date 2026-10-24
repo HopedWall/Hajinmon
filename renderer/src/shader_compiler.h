@@ -19,6 +19,12 @@ class ShaderCompiler {
     kSpirv,  // Vulkan.
   };
 
+  enum class Stage {
+    kVertex,
+    kPixel,
+    kGeometry,
+  };
+
   ShaderCompiler();
   ~ShaderCompiler();
   ShaderCompiler(const ShaderCompiler&) = delete;
@@ -29,7 +35,7 @@ class ShaderCompiler {
 
   // Compiles `hlsl` (entry point `main`). On failure, `errors` holds the
   // compiler messages.
-  bool Compile(const std::string& hlsl, bool is_vertex_shader, Target target,
+  bool Compile(const std::string& hlsl, Stage stage, Target target,
                std::vector<uint8_t>& binary, std::string& errors);
 
  private:

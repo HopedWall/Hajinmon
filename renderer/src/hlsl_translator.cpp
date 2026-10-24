@@ -19,29 +19,100 @@ using namespace rex::graphics;
 namespace {
 
 constexpr uint32_t kInterpolatorCount = 16;
+constexpr uint32_t kMaxTextureSlots = HlslShaderTranslator::kMaxTextureSlots;
 
 const char kHlslPrologue[] = R"(// Translated from Xenos microcode by Hajinmon.
 #define XE_FLT_MAX 3.402823466e+38f
 
-cbuffer XeSystemConstants : register(b0, space0) {
-  // Bit 0: position XY is divided by W, bit 1: Z is divided by W, bit 2: W is
-  // 1/W (PA_CL_VTE_CNTL).
-  uint xe_flags;
-  int xe_vertex_index_offset;
-  // Interpolator receiving the pixel parameters, plus 1 (0 - none).
-  uint xe_ps_param_gen;
-  // Alpha test function (0 - never ... 7 - always).
-  uint xe_alpha_test;
-  float4 xe_ndc_scale;
-  float4 xe_ndc_offset;
-  float xe_alpha_ref;
-  float3 xe_system_padding;
+// Byte offsets of this draw's constant blocks in xe_draw_constants.
+struct XePushConstants {
+  uint system;
+  uint vertex_float;
+  uint pixel_float;
+  // Dwords 0-7: bool constants, 8-39: loop constants.
+  uint bool_loop;
+  uint fetch;
+  uint padding0;
+  uint padding1;
+  uint padding2;
 };
-cbuffer XeFloatConstants : register(b1, space0) { float4 xe_c[256]; };
-// Dwords 0-7: bool constants, 8-39: loop constants.
-cbuffer XeBoolLoopConstants : register(b2, space0) { uint4 xe_bool_loop[10]; };
-cbuffer XeFetchConstants : register(b3, space0) { uint4 xe_fetch[48]; };
+[[vk::push_constant]] ConstantBuffer<XePushConstants> xe_push : register(b0, space8);
 ByteAddressBuffer xe_shared_memory : register(t0, space0);
+ByteAddressBuffer xe_draw_constants : register(t1, space0);
+Texture2D xe_textures_2d[] : register(t0, space1);
+Texture3D xe_textures_3d[] : register(t0, space2);
+TextureCube xe_textures_cube[] : register(t0, space3);
+SamplerState xe_samplers[] : register(s0, space4);
+
+// System constants, see SystemConstants in plume_command_processor.cpp.
+// Bit 0: position XY is divided by W, bit 1: Z is divided by W, bit 2: W is
+// 1/W (PA_CL_VTE_CNTL).
+static uint xe_flags;
+static int xe_vertex_index_offset;
+// Interpolator receiving the pixel parameters, plus 1 (0 - none).
+static uint xe_ps_param_gen;
+// Alpha test function (0 - never ... 7 - always).
+static uint xe_alpha_test;
+static float4 xe_ndc_scale;
+static float4 xe_ndc_offset;
+static float xe_alpha_ref;
+static uint xe_vertex_index_endian;
+// Float constants and texture bindings of this stage.
+static uint xe_float_base;
+static uint xe_texture_base;
+void xe_load_system_constants(bool is_pixel_shader) {
+  uint base = xe_push.system;
+  uint4 v = xe_draw_constants.Load4(base);
+  xe_flags = v.x;
+  xe_vertex_index_offset = int(v.y);
+  xe_ps_param_gen = v.z;
+  xe_alpha_test = v.w;
+  xe_ndc_scale = asfloat(xe_draw_constants.Load4(base + 16u));
+  xe_ndc_offset = asfloat(xe_draw_constants.Load4(base + 32u));
+  v = xe_draw_constants.Load4(base + 48u);
+  xe_alpha_ref = asfloat(v.x);
+  xe_vertex_index_endian = v.y;
+  xe_float_base = is_pixel_shader ? xe_push.pixel_float : xe_push.vertex_float;
+  xe_texture_base = base + (is_pixel_shader ? 192u : 64u);
+}
+float4 xe_c(int index) {
+  return asfloat(xe_draw_constants.Load4(xe_float_base + uint(clamp(index, 0, 255)) * 16u));
+}
+// x - texture index | sampler index << 20, y - swizzle (3 bits per component).
+uint2 xe_texture_binding(uint slot) { return xe_draw_constants.Load2(xe_texture_base + slot * 8u); }
+// Xenos applies the blend factors to min/max blending, Direct3D 12 and Vulkan
+// ignore them: the factors depending only on the source are applied here
+// (Dead or Alive 4 draws PRESS START with max(src * src_alpha, dest), an
+// opaque white box otherwise).
+float3 xe_blend_source_factor(uint factor, float4 color) {
+  if (factor == 0u) return 0.0f.xxx;
+  if (factor == 4u) return color.rgb;
+  if (factor == 5u) return 1.0f - color.rgb;
+  if (factor == 6u) return color.aaa;
+  if (factor == 7u) return (1.0f - color.a).xxx;
+  return 1.0f.xxx;
+}
+float4 xe_apply_min_max_factors(float4 color, uint target) {
+  uint control = xe_draw_constants.Load(xe_push.system + 320u + target * 4u);
+  float4 result = color;
+  uint color_op = (control >> 5u) & 7u;
+  if (color_op == 2u || color_op == 3u) {
+    result.rgb *= xe_blend_source_factor(control & 31u, color);
+  }
+  uint alpha_op = (control >> 21u) & 7u;
+  if (alpha_op == 2u || alpha_op == 3u) {
+    result.a *= xe_blend_source_factor((control >> 16u) & 31u, color.aaaa).x;
+  }
+  return result;
+}
+float4 xe_swizzle(float4 value, uint swizzle) {
+  float4 result;
+  [unroll] for (uint i = 0u; i < 4u; ++i) {
+    uint source = (swizzle >> (i * 3u)) & 7u;
+    result[i] = source < 4u ? value[source] : (source == 5u ? 1.0f : 0.0f);
+  }
+  return result;
+}
 
 float xe_mul(float a, float b) { return (a == 0.0f || b == 0.0f) ? 0.0f : a * b; }
 float4 xe_mul(float4 a, float4 b) { return (a == 0.0f || b == 0.0f) ? 0.0f : a * b; }
@@ -79,14 +150,12 @@ int xe_address(float v, bool round) {
   return int(floor(clamp(v, -256.0f, 255.0f) + (round ? 0.5f : 0.0f)));
 }
 uint xe_bool(uint index) {
-  uint d = index >> 5u;
-  return (xe_bool_loop[d >> 2u][d & 3u] >> (index & 31u)) & 1u;
+  return (xe_draw_constants.Load(xe_push.bool_loop + (index >> 5u) * 4u) >> (index & 31u)) & 1u;
 }
 uint xe_loop_constant(uint index) {
-  uint d = 8u + index;
-  return xe_bool_loop[d >> 2u][d & 3u];
+  return xe_draw_constants.Load(xe_push.bool_loop + 32u + index * 4u);
 }
-uint xe_fetch_dword(uint index) { return xe_fetch[index >> 2u][index & 3u]; }
+uint xe_fetch_dword(uint index) { return xe_draw_constants.Load(xe_push.fetch + index * 4u); }
 uint xe_swap(uint v, uint endian) {
   if (endian == 1u || endian == 2u) v = ((v & 0x00FF00FFu) << 8u) | ((v >> 8u) & 0x00FF00FFu);
   if (endian == 2u || endian == 3u) v = (v << 16u) | (v >> 16u);
@@ -359,13 +428,13 @@ std::string HlslShaderTranslator::OperandExpression(const InstructionOperand& op
     case InstructionStorageSource::kConstantFloat:
       switch (operand.storage_addressing_mode) {
         case InstructionStorageAddressingMode::kAddressRegisterRelative:
-          value = fmt::format("xe_c[clamp({} + xe_a0, 0, 255)]", operand.storage_index);
+          value = fmt::format("xe_c({} + xe_a0)", operand.storage_index);
           break;
         case InstructionStorageAddressingMode::kLoopRelative:
-          value = fmt::format("xe_c[clamp({} + xe_aL, 0, 255)]", operand.storage_index);
+          value = fmt::format("xe_c({} + xe_aL)", operand.storage_index);
           break;
         default:
-          value = fmt::format("xe_c[{}]", operand.storage_index & 255);
+          value = fmt::format("xe_c({})", operand.storage_index & 255);
           break;
       }
       break;
@@ -988,10 +1057,16 @@ void HlslShaderTranslator::ProcessTextureFetchInstruction(
     case ucode::FetchOpcode::kGetTextureComputedLod:
     case ucode::FetchOpcode::kGetTextureWeights: {
       uint32_t slot = TextureSlotIndex(instr.operands[1].storage_index, instr.dimension);
-      std::string texture = fmt::format("xe_texture{}", slot);
-      std::string sampler = fmt::format("xe_sampler{}", slot);
+      if (slot >= kMaxTextureSlots) {
+        EmitTranslationError("Too many textures", false);
+        slot = kMaxTextureSlots - 1;
+      }
       bool is_cube = instr.dimension == xenos::FetchOpDimension::kCube;
       bool is_3d = instr.dimension == xenos::FetchOpDimension::k3DOrStacked;
+      Line(fmt::format("uint2 xe_tb = xe_texture_binding({}u);", slot));
+      std::string texture = fmt::format("xe_textures_{}[xe_tb.x & 0xFFFFFu]",
+                                        is_cube ? "cube" : is_3d ? "3d" : "2d");
+      std::string sampler = "xe_samplers[xe_tb.x >> 20u]";
       bool is_1d = instr.dimension == xenos::FetchOpDimension::k1D;
       // Texture size, for unnormalized coordinates, offsets and weights.
       bool has_offset = !is_cube && (attributes.offset_x || attributes.offset_y ||
@@ -1073,7 +1148,7 @@ void HlslShaderTranslator::ProcessTextureFetchInstruction(
       } else {
         sample = fmt::format("{}.SampleLevel({}, {}, {})", texture, sampler, coord, bias);
       }
-      StoreResult(instr.result, sample);
+      StoreResult(instr.result, "xe_swizzle(" + sample + ", xe_tb.y)");
     } break;
     default:
       EmitTranslationError(
@@ -1102,26 +1177,6 @@ std::vector<uint8_t> HlslShaderTranslator::CompleteTranslation() {
   } else {
     hlsl += "static float4 xe_o_color[4];\n";
     hlsl += "static float4 xe_o_depth;\n";
-  }
-
-  // Textures and samplers of this stage.
-  uint32_t space = is_vertex_shader() ? 1 : 2;
-  for (uint32_t i = 0; i < uint32_t(texture_slots_.size()); ++i) {
-    const char* type;
-    switch (texture_slots_[i].dimension) {
-      case xenos::FetchOpDimension::k3DOrStacked:
-        type = "Texture3D";
-        break;
-      case xenos::FetchOpDimension::kCube:
-        type = "TextureCube";
-        break;
-      default:
-        type = "Texture2D";
-        break;
-    }
-    hlsl += fmt::format("{} xe_texture{} : register(t{}, space{});  // fetch constant {}\n", type,
-                        i, i, space, texture_slots_[i].fetch_constant);
-    hlsl += fmt::format("SamplerState xe_sampler{} : register(s{}, space{});\n", i, i, space);
   }
 
   // The translated program.
@@ -1162,7 +1217,11 @@ std::vector<uint8_t> HlslShaderTranslator::CompleteTranslation() {
   hlsl += "};\n\n";
   if (is_vertex_shader()) {
     hlsl += "XeVertexOutput main(uint xe_vertex_id : SV_VertexID) {\n";
-    hlsl += "  r[0].x = float(int(xe_vertex_id) + xe_vertex_index_offset);\n";
+    hlsl += "  xe_load_system_constants(false);\n";
+    // Guest indices are fetched from memory as they are, big-endian.
+    hlsl += "  uint xe_index = xe_swap(xe_vertex_id, xe_vertex_index_endian);\n";
+    hlsl += "  if (xe_vertex_index_endian == 1u) xe_index &= 0xFFFFu;\n";
+    hlsl += "  r[0].x = float(int(xe_index) + xe_vertex_index_offset);\n";
     hlsl += "  xe_execute();\n";
     hlsl += "  XeVertexOutput xe_output;\n";
     hlsl += "  xe_output.interpolators = xe_o_interpolators;\n";
@@ -1196,6 +1255,7 @@ std::vector<uint8_t> HlslShaderTranslator::CompleteTranslation() {
     hlsl += fmt::format("{} main(XeVertexOutput xe_input, bool xe_front_facing : SV_IsFrontFace) {{\n",
                         has_outputs ? "XePixelOutput" : "void");
     uint32_t interpolators = std::min(register_count, kInterpolatorCount);
+    hlsl += "  xe_load_system_constants(true);\n";
     hlsl += fmt::format("  for (uint xe_i = 0u; xe_i < {}u; ++xe_i) {{\n", interpolators);
     hlsl += "    r[xe_i] = xe_input.interpolators[xe_i];\n";
     hlsl += "  }\n";
@@ -1223,7 +1283,8 @@ std::vector<uint8_t> HlslShaderTranslator::CompleteTranslation() {
     }
     for (uint32_t i = 0; i < 4; ++i) {
       if (shader.writes_color_target(i)) {
-        hlsl += fmt::format("  xe_output.color{} = xe_o_color[{}];\n", i, i);
+        hlsl += fmt::format("  xe_output.color{} = xe_apply_min_max_factors(xe_o_color[{}], {}u);\n",
+                            i, i, i);
       }
     }
     if (shader.writes_depth()) {

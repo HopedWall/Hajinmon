@@ -66,7 +66,7 @@ bool ShaderCompiler::Initialize() {
   return true;
 }
 
-bool ShaderCompiler::Compile(const std::string& hlsl, bool is_vertex_shader, Target target,
+bool ShaderCompiler::Compile(const std::string& hlsl, Stage stage, Target target,
                              std::vector<uint8_t>& binary, std::string& errors) {
   binary.clear();
   errors.clear();
@@ -75,19 +75,21 @@ bool ShaderCompiler::Compile(const std::string& hlsl, bool is_vertex_shader, Tar
     return false;
   }
   std::vector<LPCWSTR> arguments = {
-      L"-E", L"main", L"-T", is_vertex_shader ? L"vs_6_0" : L"ps_6_0",
+      L"-E", L"main", L"-T", stage == Stage::kVertex ? L"vs_6_0" : stage == Stage::kPixel ? L"ps_6_0" : L"gs_6_0",
       // HLSL 2018: vector ?: and ||, as written by the translator.
       L"-HV", L"2018", L"-O3",
   };
   if (target == Target::kSpirv) {
     arguments.insert(arguments.end(), {
         L"-spirv", L"-fspv-target-env=vulkan1.1",
-        // Separate binding ranges per register type within each space.
-        L"-fvk-t-shift", L"16", L"0", L"-fvk-t-shift", L"16", L"1", L"-fvk-t-shift", L"16", L"2",
-        L"-fvk-s-shift", L"48", L"0", L"-fvk-s-shift", L"48", L"1", L"-fvk-s-shift", L"48", L"2",
     });
-    // Direct3D conventions for the position.
-    arguments.push_back(is_vertex_shader ? L"-fvk-invert-y" : L"-fvk-use-dx-position-w");
+    // Direct3D conventions for the position. Y is inverted once, by the vertex
+    // shader, before the geometry shader if there is one.
+    if (stage == Stage::kVertex) {
+      arguments.push_back(L"-fvk-invert-y");
+    } else if (stage == Stage::kPixel) {
+      arguments.push_back(L"-fvk-use-dx-position-w");
+    }
   }
 
   DxcBuffer source = {};

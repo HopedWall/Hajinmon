@@ -81,14 +81,15 @@ int main(int argc, char** argv) {
     for (const auto& error : translation.errors()) {
       messages += fmt::format("translation {}: {}\n", error.is_fatal ? "error" : "warning", error.message);
     }
+    auto stage = entry.is_vertex_shader ? ShaderCompiler::Stage::kVertex : ShaderCompiler::Stage::kPixel;
     std::vector<uint8_t> binary;
     std::string errors;
-    bool dxil = compiler.Compile(hlsl, entry.is_vertex_shader, ShaderCompiler::Target::kDxil, binary, errors);
+    bool dxil = compiler.Compile(hlsl, stage, ShaderCompiler::Target::kDxil, binary, errors);
     if (!errors.empty()) {
       messages += "DXIL:\n" + errors;
     }
     bool spirv =
-        compiler.Compile(hlsl, entry.is_vertex_shader, ShaderCompiler::Target::kSpirv, binary, errors);
+        compiler.Compile(hlsl, stage, ShaderCompiler::Target::kSpirv, binary, errors);
     if (!errors.empty()) {
       messages += "SPIR-V:\n" + errors;
     }
