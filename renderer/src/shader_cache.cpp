@@ -230,14 +230,16 @@ bool ShaderCache::Build(rex::graphics::Shader& shader, CompiledShader& out) {
   return true;
 }
 
-void ShaderCache::StartPrewarm(std::vector<PrewarmShader> shaders) {
+void ShaderCache::StartPrewarm(std::vector<PrewarmShader> shaders, uint32_t threads) {
   StopPrewarm();
   prewarm_shaders_ = std::move(shaders);
   prewarm_next_ = 0;
   prewarm_stop_ = false;
   prewarm_skipped_ = 0;
-  // Leave most cores to the game, which is starting at the same time.
-  uint32_t threads = std::clamp(std::thread::hardware_concurrency() / 2, 1u, 8u);
+  // By default, leave most cores to the game, which is starting at the same time.
+  if (!threads) {
+    threads = std::clamp(std::thread::hardware_concurrency() / 2, 1u, 8u);
+  }
   prewarm_remaining_workers_ = threads;
   for (uint32_t i = 0; i < threads; ++i) {
     prewarm_threads_.emplace_back(&ShaderCache::PrewarmWorker, this);
@@ -252,9 +254,21 @@ void ShaderCache::StopPrewarm() {
   prewarm_threads_.clear();
 }
 
+void ShaderCache::WaitForPrewarm() {
+  for (std::thread& thread : prewarm_threads_) {
+    thread.join();
+  }
+  prewarm_threads_.clear();
+}
+
 void ShaderCache::PrewarmWorker() {
   auto start = std::chrono::steady_clock::now();
   while (!prewarm_stop_) {
+    // The shaders the game is waiting for come first: on slower CPUs, compiling
+    // both at once could make a draw wait long enough to stall the game.
+    while (pending_builds_ && !prewarm_stop_) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
     size_t index = prewarm_next_++;
     if (index >= prewarm_shaders_.size()) {
       break;

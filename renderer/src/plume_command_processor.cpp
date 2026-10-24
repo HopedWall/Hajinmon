@@ -3,11 +3,21 @@
 #include "plume_command_processor.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <thread>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #include <fmt/format.h>
 #include <rex/cvar.h>
 #include <rex/graphics/util/draw.h>
+#include <rex/logging/api.h>
 #include <rex/logging/macros.h>
 #include <rex/string/buffer.h>
 #include <rex/system/xmemory.h>
@@ -15,6 +25,10 @@
 
 #include "plume_graphics_system.h"
 
+REXCVAR_DEFINE_BOOL(plume_precompile_shaders, false, "GPU/Plume",
+                    "Compile the shaders of the executable and those recorded in previous sessions "
+                    "to the shader cache with all the cores, then exit (used by the launcher)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(plume_async_shaders, false, "GPU/Plume",
                     "Skip draws whose shaders are still compiling instead of waiting for them");
 
@@ -148,7 +162,23 @@ void PlumeCommandProcessor::InitializeShaderStorage(const std::filesystem::path&
     prewarm.push_back({std::vector<uint32_t>(ucode, ucode + entry.ucode_dword_count),
                        entry.is_vertex_shader, true});
   }
-  shader_cache_->StartPrewarm(std::move(prewarm));
+  if (!REXCVAR_GET(plume_precompile_shaders)) {
+    shader_cache_->StartPrewarm(std::move(prewarm));
+    return;
+  }
+  // Precompilation only: before the game starts, so it can use every core.
+  shader_cache_->StartPrewarm(std::move(prewarm), std::max(std::thread::hardware_concurrency(), 1u));
+  shader_cache_->WaitForPrewarm();
+  const ShaderCache::Stats& stats = shader_cache_->stats();
+  bool ok = stats.compiled + stats.loaded > 0 || !stats.failed;
+  REXLOG_INFO("Plume: shader precompilation {}, exiting", ok ? "done" : "failed");
+  rex::FlushLogging();
+#ifdef _WIN32
+  // Without unloading the DLLs (DXC does not support being unloaded with its
+  // threads around).
+  TerminateProcess(GetCurrentProcess(), ok ? 0 : 1);
+#endif
+  std::_Exit(ok ? 0 : 1);
 }
 
 Shader* PlumeCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,

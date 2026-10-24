@@ -191,7 +191,9 @@ settings (shown in the *Advanced* tab). Settings are stored in
   (anisotropic up to 16x), anti-aliasing (FXAA; MSAA with Plume), scaling filter
   (bilinear, AMD CAS sharpening or AMD FSR upscaling), VSync, 16:9
   letterboxing, the graphics API (Direct3D 12 or Vulkan) and the GPU to use.
-  With Plume, FXAA, CAS/FSR and the GPU choice are not available.
+  With Plume, FXAA, CAS/FSR and the GPU choice are not available; *Precompile
+  shaders* compiles the shaders it knows in advance (useful on slower devices),
+  and *Clear shader cache* deletes the compiled ones.
 - **Game**: language (English, Japanese, German, French, Spanish, Italian),
   save folder, game (the `.iso` disc image or the folder extracted from it) and
   game executable. Empty paths use the defaults shown in grey: the release
@@ -309,6 +311,7 @@ only.
 | `--no-plume_vsync` | Present without waiting for the vertical blank (tearing). |
 | `--no-plume_letterbox` | Stretch the image instead of keeping 16:9. |
 | `--plume_async_shaders` | Skip draws whose shaders are still compiling instead of waiting for them. |
+| `--plume_precompile_shaders` | Compile the executable's shaders and those seen in earlier sessions with every core, then exit (the launcher's *Precompile shaders*). |
 
 `F3` saves a screenshot to `Pictures\Hajinmon`. For debugging,
 `--plume_capture_path=FOLDER` saves a frame every `--plume_capture_interval`

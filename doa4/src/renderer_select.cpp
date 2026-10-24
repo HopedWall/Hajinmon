@@ -11,9 +11,15 @@
 
 #if HAJINMON_PLUME_RENDERER
 #include "plume_graphics_system.h"
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <SDL3/SDL.h>
 #endif
+REXCVAR_DECLARE(bool, plume_precompile_shaders);
 #endif
 
 REXCVAR_DEFINE_STRING(renderer, "xenia", "GPU",
@@ -23,11 +29,38 @@ REXCVAR_DEFINE_STRING(renderer, "xenia", "GPU",
 
 namespace doa4 {
 
+#if HAJINMON_PLUME_RENDERER && defined(_WIN32)
+namespace {
+
+// The shader precompilation (started by the launcher) needs no window, but the
+// SDK always opens one: right before it is shown, the game window is made
+// invisible (layered, never given an opacity), without a taskbar button and
+// without taking the focus.
+LRESULT CALLBACK HideWindowHook(int code, WPARAM wparam, LPARAM lparam) {
+  const CWPSTRUCT* message = reinterpret_cast<const CWPSTRUCT*>(lparam);
+  if (code == HC_ACTION && message->message == WM_SHOWWINDOW && message->wParam &&
+      !(GetWindowLongW(message->hwnd, GWL_STYLE) & WS_CHILD)) {
+    SetWindowLongW(message->hwnd, GWL_EXSTYLE,
+                   GetWindowLongW(message->hwnd, GWL_EXSTYLE) | WS_EX_LAYERED | WS_EX_TOOLWINDOW |
+                       WS_EX_NOACTIVATE);
+  }
+  return CallNextHookEx(nullptr, code, wparam, lparam);
+}
+
+}  // namespace
+#endif
+
 std::unique_ptr<rex::system::IGraphicsSystem> CreateSelectedGraphicsSystem() {
   if (REXCVAR_GET(renderer) != "plume") {
     return nullptr;
   }
 #if HAJINMON_PLUME_RENDERER
+#if defined(_WIN32)
+  // Called on the UI thread, before the window is created.
+  if (REXCVAR_GET(plume_precompile_shaders)) {
+    SetWindowsHookExW(WH_CALLWNDPROC, HideWindowHook, nullptr, GetCurrentThreadId());
+  }
+#endif
   return std::make_unique<hajinmon::renderer::PlumeGraphicsSystem>();
 #else
   REXLOG_ERROR("doa4: this build has no native renderer, using Xenos emulation");

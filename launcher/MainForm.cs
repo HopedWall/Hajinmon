@@ -91,6 +91,8 @@ public sealed class MainForm : Form
     private readonly ComboBox _msaa = Combo();
     private readonly ComboBox _api = Combo();
     private readonly ComboBox _gpu = Combo();
+    private readonly Button _precompileShaders = new() { Text = "Precompile shaders", AutoSize = true };
+    private readonly Button _clearShaderCache = new() { Text = "Clear shader cache", AutoSize = true };
     // The GPU list depends on the API: DXGI and Vulkan number the GPUs differently.
     private readonly List<int> _gpuIndices = new();
     private List<GpuList.Adapter>? _dxgiAdapters;
@@ -304,6 +306,12 @@ public sealed class MainForm : Form
         AddRow(grid, "MSAA", _msaa);
         AddRow(grid, "Scaling filter", _scaling);
         AddRow(grid, "Graphics card", _gpu);
+        _precompileShaders.Click += async (_, _) => await PrecompileShaders();
+        _clearShaderCache.Click += (_, _) => ClearShaderCache();
+        var shaderButtons = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = Padding.Empty };
+        shaderButtons.Controls.Add(_precompileShaders);
+        shaderButtons.Controls.Add(_clearShaderCache);
+        AddRow(grid, "Plume shaders", shaderButtons);
         AddRow(grid, null, _vsync);
         AddRow(grid, null, _keepAspect);
         AddRow(grid, null, Note(
@@ -313,7 +321,9 @@ public sealed class MainForm : Form
         AddRow(grid, null, Note(
             "The Plume renderer draws the game natively instead of emulating the Xbox 360 GPU. " +
             "It is experimental: it has its own MSAA (smoother edges) but no FXAA, CAS or FSR, " +
-            "and always uses the default graphics card."));
+            "and always uses the default graphics card. It compiles the game's shaders the first " +
+            "time they appear; \"Precompile shaders\" compiles the known ones in advance (all of " +
+            "them after a first play), for slower devices or after an update."));
 
         page.Controls.Add(grid);
         return page;
@@ -331,6 +341,8 @@ public sealed class MainForm : Form
         _scaling.Enabled = !plume;
         _gpu.Enabled = !plume;
         _msaa.Enabled = plume;
+        _precompileShaders.Enabled = plume;
+        _clearShaderCache.Enabled = plume;
         UpdatePreview();
     }
 
@@ -658,7 +670,10 @@ public sealed class MainForm : Form
 
     private static string Flag(string name, bool value) => value ? $"--{name}" : $"--no-{name}";
 
-    private string BuildArguments()
+    /// <param name="precompile">For the shader precompilation: a small window, and the
+    /// game exits once the shaders are compiled. Options must not repeat: the game stops
+    /// reading the command line at a repeated option.</param>
+    private string BuildArguments(bool precompile = false)
     {
         var s = _settings;
         var args = new List<string> { "--gpu_plugin=xenos", "--alloc_top_down" };
@@ -667,11 +682,12 @@ public sealed class MainForm : Form
         if (gameFolder != null) args.Add($"--game_data_root={Quote(gameFolder)}");
         if (!string.IsNullOrWhiteSpace(s.SaveFolder)) args.Add($"--user_data_root={Quote(s.SaveFolder)}");
 
-        args.Add(Flag("fullscreen", s.Fullscreen));
-        args.Add($"--window_width={s.WindowWidth}");
-        args.Add($"--window_height={s.WindowHeight}");
+        args.Add(Flag("fullscreen", s.Fullscreen && !precompile));
+        args.Add($"--window_width={(precompile ? 640 : s.WindowWidth)}");
+        args.Add($"--window_height={(precompile ? 360 : s.WindowHeight)}");
+        if (precompile) args.Add("--plume_precompile_shaders");
         args.Add(Flag("vsync", s.VSync));
-        if (s.Renderer == "plume")
+        if (s.Renderer == "plume" || precompile)
         {
             // The native renderer has its own options.
             args.Add("--renderer=plume");
@@ -724,46 +740,8 @@ public sealed class MainForm : Form
     {
         ReadControls();
         TrySave();
-
-        string? exe = EffectiveGameExecutable();
-        if (string.IsNullOrWhiteSpace(_settings.GameExecutable) && GameRuntime.IsEmbedded)
-        {
-            try
-            {
-                UseWaitCursor = true;
-                exe = GameRuntime.Extract();
-            }
-            catch (Exception e)
-            {
-                MessageBox.Show(this, $"Could not unpack the game runtime:\n{e.Message}", Text,
-                                MessageBoxButtons.OK, MessageBoxIcon.Error);
-                return;
-            }
-            finally
-            {
-                UseWaitCursor = false;
-            }
-        }
-        if (exe == null || !File.Exists(exe))
-        {
-            MessageBox.Show(this, "The game executable (HajinmonGame.exe) was not found. Set \"Game executable\" in the Game tab.",
-                            Text, MessageBoxButtons.OK, MessageBoxIcon.Error);
-            return;
-        }
-        string? gameFolder = EffectiveGameFolder();
-        if (!IsGamePath(gameFolder))
-        {
-            MessageBox.Show(this, "The game was not found. In the Game tab, set \"Game\" to the " +
-                                  "disc image (.iso) or to the folder extracted from it (with default.xex).",
-                            Text, MessageBoxButtons.OK, MessageBoxIcon.Error);
-            return;
-        }
-        if (Process.GetProcessesByName("HajinmonGame").Length > 0)
-        {
-            MessageBox.Show(this, "The game is already running.", Text,
-                            MessageBoxButtons.OK, MessageBoxIcon.Information);
-            return;
-        }
+        string? exe = PrepareGame();
+        if (exe == null) return;
 
         if ((_settings.UnlockAllCharacters || _settings.UnlockAllCostumes) && _settings.BackupSaveBeforeCheats)
         {
@@ -795,6 +773,150 @@ public sealed class MainForm : Form
             MessageBox.Show(this, $"Could not start the game:\n{e.Message}", Text,
                             MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
+    }
+
+    /// <summary>
+    /// Checks that the game can start (unpacking the embedded runtime if needed) and
+    /// returns HajinmonGame.exe, or null after telling the user what is missing.
+    /// </summary>
+    private string? PrepareGame()
+    {
+        string? exe = EffectiveGameExecutable();
+        if (string.IsNullOrWhiteSpace(_settings.GameExecutable) && GameRuntime.IsEmbedded)
+        {
+            try
+            {
+                UseWaitCursor = true;
+                exe = GameRuntime.Extract();
+            }
+            catch (Exception e)
+            {
+                MessageBox.Show(this, $"Could not unpack the game runtime:\n{e.Message}", Text,
+                                MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return null;
+            }
+            finally
+            {
+                UseWaitCursor = false;
+            }
+        }
+        if (exe == null || !File.Exists(exe))
+        {
+            MessageBox.Show(this, "The game executable (HajinmonGame.exe) was not found. Set \"Game executable\" in the Game tab.",
+                            Text, MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return null;
+        }
+        string? gameFolder = EffectiveGameFolder();
+        if (!IsGamePath(gameFolder))
+        {
+            MessageBox.Show(this, "The game was not found. In the Game tab, set \"Game\" to the " +
+                                  "disc image (.iso) or to the folder extracted from it (with default.xex).",
+                            Text, MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return null;
+        }
+        if (Process.GetProcessesByName("HajinmonGame").Length > 0)
+        {
+            MessageBox.Show(this, "The game is already running.", Text,
+                            MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return null;
+        }
+
+        return exe;
+    }
+
+    /// <summary>
+    /// Runs the game in its precompilation mode: it compiles the shaders it knows (those
+    /// of the executable and those recorded while playing) to the shader cache with every
+    /// core, then exits. The cache matches the selected graphics API.
+    /// </summary>
+    private async Task PrecompileShaders()
+    {
+        ReadControls();
+        TrySave();
+        string? exe = PrepareGame();
+        if (exe == null) return;
+
+        string log = Path.Combine(Path.GetTempPath(), "Hajinmon_precompile.log");
+        try { File.Delete(log); } catch (IOException) { }
+        string arguments = BuildArguments(precompile: true) + $" --log_file={Quote(log)}";
+        Enabled = false;
+        UseWaitCursor = true;
+        string oldText = _precompileShaders.Text;
+        _precompileShaders.Text = "Precompiling...";
+        try
+        {
+            using var process = Process.Start(new ProcessStartInfo
+            {
+                FileName = exe,
+                Arguments = arguments,
+                WorkingDirectory = Path.GetDirectoryName(exe)!,
+                UseShellExecute = false,
+            })!;
+            await process.WaitForExitAsync();
+            // The game's own summary: "shader prewarm done in X s (N compiled, ...)".
+            string? summary = null;
+            try
+            {
+                summary = File.ReadLines(log).LastOrDefault(line => line.Contains("shader prewarm done"));
+            }
+            catch (IOException) { }
+            if (summary != null) summary = summary[summary.IndexOf("shader prewarm")..];
+            if (process.ExitCode == 0)
+            {
+                MessageBox.Show(this, "The shaders are ready" + (summary != null ? $":\n{summary}" : "."), Text,
+                                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            else
+            {
+                MessageBox.Show(this, $"Precompiling the shaders failed (exit code {process.ExitCode}). " +
+                                      $"The game log is in:\n{log}", Text,
+                                MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+        catch (Exception e)
+        {
+            MessageBox.Show(this, $"Could not start the game:\n{e.Message}", Text,
+                            MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            _precompileShaders.Text = oldText;
+            UseWaitCursor = false;
+            Enabled = true;
+        }
+    }
+
+    /// <summary>
+    /// Deletes the compiled shaders of the Plume renderer. The list of shaders seen while
+    /// playing is kept, so "Precompile shaders" can still rebuild all of them.
+    /// </summary>
+    private void ClearShaderCache()
+    {
+        string cache = Path.Combine(EffectiveSaveFolder(), "cache", "plume");
+        var files = Directory.Exists(cache)
+            ? Directory.EnumerateFiles(cache, "*", SearchOption.AllDirectories)
+                .Where(file => !Path.GetFileName(file).Equals("loaded_shaders.bin", StringComparison.OrdinalIgnoreCase))
+                .ToList()
+            : new List<string>();
+        if (files.Count == 0)
+        {
+            MessageBox.Show(this, "The shader cache is already empty.", Text,
+                            MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        var answer = MessageBox.Show(this, $"Delete the {files.Count} compiled shaders in\n{cache}?\n\n" +
+                                           "They are compiled again when needed, or with \"Precompile shaders\".",
+                                     Text, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+        if (answer != DialogResult.Yes) return;
+        int failed = 0;
+        foreach (string file in files)
+        {
+            try { File.Delete(file); }
+            catch (Exception e) when (e is IOException || e is UnauthorizedAccessException) { failed++; }
+        }
+        MessageBox.Show(this, failed == 0 ? "The shader cache was cleared."
+                                          : $"{failed} files could not be deleted (is the game running?).",
+                        Text, MessageBoxButtons.OK, failed == 0 ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
     }
 
     /// <summary>

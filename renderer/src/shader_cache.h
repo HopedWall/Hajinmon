@@ -66,8 +66,11 @@ class ShaderCache {
     // the game patches them before use.
     bool from_executable;
   };
-  void StartPrewarm(std::vector<PrewarmShader> shaders);
+  // `threads` 0: half of the cores, leaving the others to the game.
+  void StartPrewarm(std::vector<PrewarmShader> shaders, uint32_t threads = 0);
   void StopPrewarm();
+  // Waits for the prewarm started by StartPrewarm to finish.
+  void WaitForPrewarm();
 
   // The shaders the game loaded in previous sessions (recorded in the storage
   // directory), to prewarm: after a translator change they are all compiled
