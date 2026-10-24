@@ -21,6 +21,10 @@ REXCVAR_DEFINE_STRING(plume_backend, "auto", "GPU/Plume",
                       "Graphics API of the native renderer: auto, d3d12, vulkan")
     .allowed({"auto", "d3d12", "vulkan"})
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(plume_vsync, true, "GPU/Plume",
+                    "Native renderer: present on vertical blank (no tearing)");
+REXCVAR_DEFINE_BOOL(plume_letterbox, true, "GPU/Plume",
+                    "Native renderer: keep the 16:9 aspect ratio (black bars), else stretch");
 REXCVAR_DEFINE_INT32(plume_resolution_scale, 2, "GPU/Plume",
                      "Native renderer resolution scale (1 = 1280x720, 2 = 2560x1440...)")
     .range(1, 4)
@@ -238,7 +242,7 @@ bool PlumeRenderer::EnsureSwapChain() {
       REXLOG_ERROR("Plume: could not create the swap chain");
       return false;
     }
-    swap_chain_->setVsyncEnabled(true);
+    swap_chain_->setVsyncEnabled(REXCVAR_GET(plume_vsync));
     swap_chain_->resize();
   } else if (swap_chain_->needsResize()) {
     WaitForIdle();
@@ -356,9 +360,13 @@ bool PlumeRenderer::EndFrame(TrackedTexture* source, uint32_t width, uint32_t he
     list->setScissors(plume::RenderRect(0, 0, int32_t(target_width), int32_t(target_height)));
     list->clearColor(0, plume::RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
     if (source && width && height) {
-      // Letterbox to the aspect ratio of the source.
+      // Letterboxed to the aspect ratio of the source, or stretched.
       float scale = std::min(float(target_width) / float(width), float(target_height) / float(height));
       float view_width = float(width) * scale, view_height = float(height) * scale;
+      if (!REXCVAR_GET(plume_letterbox)) {
+        view_width = float(target_width);
+        view_height = float(target_height);
+      }
       list->setViewports(plume::RenderViewport((float(target_width) - view_width) * 0.5f,
                                                (float(target_height) - view_height) * 0.5f,
                                                view_width, view_height));

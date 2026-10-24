@@ -30,6 +30,13 @@ New-Item -ItemType Directory -Force $stage | Out-Null
 foreach ($file in "HajinmonGame.exe", "rexruntimerd.dll", "rexgpu-xenosrd.dll", "TracyClientrd.dll") {
     Copy-Item (Join-Path $build $file) $stage
 }
+# The shader compiler of the native (Plume) renderer, in builds that have it.
+foreach ($file in "dxcompiler.dll", "dxil.dll") {
+    $path = Join-Path $build $file
+    if (Test-Path $path) { Copy-Item $path $stage }
+}
+$plumeLicense = Join-Path $root "external\plume\LICENSE"
+if (Test-Path $plumeLicense) { Copy-Item $plumeLicense (Join-Path $stage "LICENSE-plume.txt") }
 
 # Visual C++ runtime, app-local, so players do not need to install it.
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"

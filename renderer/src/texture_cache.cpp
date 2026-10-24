@@ -8,11 +8,17 @@
 #include <fmt/format.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
+#include <rex/cvar.h>
 #include <rex/logging/macros.h>
 #include <rex/system/xmemory.h>
 
 #include "plume_shared_memory.h"
 #include "render_target_cache.h"
+
+REXCVAR_DEFINE_INT32(plume_anisotropic, -1, "GPU/Plume",
+                     "Native renderer anisotropic filtering: -1 as the game sets it, 0 off, 2 2x, "
+                     "3 4x, 4 8x, 5 16x")
+    .range(-1, 5);
 
 namespace hajinmon::renderer {
 
@@ -261,10 +267,13 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& l
 }
 
 uint32_t TextureCache::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
+  // Anisotropic filtering: the game's, or the plume_anisotropic override.
+  uint32_t aniso = REXCVAR_GET(plume_anisotropic) >= 0 ? uint32_t(REXCVAR_GET(plume_anisotropic))
+                                                        : uint32_t(fetch.aniso_filter);
   uint32_t key = uint32_t(fetch.clamp_x) | (uint32_t(fetch.clamp_y) << 3) |
                  (uint32_t(fetch.clamp_z) << 6) | (uint32_t(fetch.mag_filter) << 9) |
                  (uint32_t(fetch.min_filter) << 11) | (uint32_t(fetch.mip_filter) << 13) |
-                 (uint32_t(fetch.aniso_filter) << 15) | (uint32_t(fetch.border_color) << 18);
+                 (aniso << 15) | (uint32_t(fetch.border_color) << 18);
   auto it = sampler_indices_.find(key);
   if (it != sampler_indices_.end()) {
     return it->second;
@@ -301,7 +310,6 @@ uint32_t TextureCache::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
   if (fetch.mip_filter == xenos::TextureFilter::kBaseMap) {
     desc.maxLOD = 0.0f;
   }
-  uint32_t aniso = uint32_t(fetch.aniso_filter);
   if (aniso > uint32_t(xenos::AnisoFilter::kMax_1_1) && aniso <= uint32_t(xenos::AnisoFilter::kMax_16_1)) {
     desc.anisotropyEnabled = true;
     desc.maxAnisotropy = 1u << (aniso - 1);

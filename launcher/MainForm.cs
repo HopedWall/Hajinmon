@@ -47,6 +47,19 @@ public sealed class MainForm : Form
         ("AMD FidelityFX FSR (upscale, use with resolution scale 1x)", "fsr"),
     };
 
+    private static readonly (string Label, string Value)[] RendererOptions =
+    {
+        ("Xenia (emulated Xbox 360 GPU, recommended)", "xenia"),
+        ("Plume (native renderer, experimental)", "plume"),
+    };
+
+    private static readonly (string Label, int Value)[] MsaaOptions =
+    {
+        ("2x (as the game)", 2),
+        ("4x", 4),
+        ("8x", 8),
+    };
+
     private static readonly (string Label, string Value)[] ApiOptions =
     {
         ("Direct3D 12 (recommended)", "d3d12"),
@@ -74,6 +87,8 @@ public sealed class MainForm : Form
     private readonly ComboBox _antiAliasing = Combo();
     private readonly ComboBox _scaling = Combo();
     private readonly CheckBox _keepAspect = new() { Text = "Keep 16:9 aspect ratio (black bars on other ratios)", AutoSize = true };
+    private readonly ComboBox _renderer = Combo();
+    private readonly ComboBox _msaa = Combo();
     private readonly ComboBox _api = Combo();
     private readonly ComboBox _gpu = Combo();
     // The GPU list depends on the API: DXGI and Vulkan number the GPUs differently.
@@ -271,16 +286,22 @@ public sealed class MainForm : Form
         foreach (var option in AntiAliasingOptions) _antiAliasing.Items.Add(option.Label);
         foreach (var option in ScalingOptions) _scaling.Items.Add(option.Label);
 
+        foreach (var option in RendererOptions) _renderer.Items.Add(option.Label);
+        foreach (var option in MsaaOptions) _msaa.Items.Add(option.Label);
+        _renderer.SelectedIndexChanged += (_, _) => OnRendererChanged();
+        _msaa.SelectedIndexChanged += (_, _) => UpdatePreview();
         foreach (var option in ApiOptions) _api.Items.Add(option.Label);
         _api.SelectedIndexChanged += (_, _) => OnApiChanged();
         _displayMode.SelectedIndexChanged += (_, _) => _windowSize.Enabled = _displayMode.SelectedIndex == 0;
 
+        AddRow(grid, "Renderer", _renderer);
         AddRow(grid, "Graphics API", _api);
         AddRow(grid, "Display mode", _displayMode);
         AddRow(grid, "Window size", _windowSize);
         AddRow(grid, "Internal resolution", _resolutionScale);
         AddRow(grid, "Texture filtering", _anisotropic);
         AddRow(grid, "Anti-aliasing", _antiAliasing);
+        AddRow(grid, "MSAA", _msaa);
         AddRow(grid, "Scaling filter", _scaling);
         AddRow(grid, "Graphics card", _gpu);
         AddRow(grid, null, _vsync);
@@ -289,12 +310,29 @@ public sealed class MainForm : Form
             "The internal resolution is the size the game renders at (the Xbox 360 renders at 720p). " +
             "Higher values look sharper but need a faster GPU. FSR works best when the window is " +
             "larger than the internal resolution."));
+        AddRow(grid, null, Note(
+            "The Plume renderer draws the game natively instead of emulating the Xbox 360 GPU. " +
+            "It is experimental: it has its own MSAA (smoother edges) but no FXAA, CAS or FSR, " +
+            "and always uses the default graphics card."));
 
         page.Controls.Add(grid);
         return page;
     }
 
     private string SelectedApi => ApiOptions[Math.Max(0, _api.SelectedIndex)].Value;
+
+    private bool PlumeSelected => _renderer.SelectedIndex >= 0 && RendererOptions[_renderer.SelectedIndex].Value == "plume";
+
+    /// <summary>Enables the options the selected renderer supports.</summary>
+    private void OnRendererChanged()
+    {
+        bool plume = PlumeSelected;
+        _antiAliasing.Enabled = !plume;
+        _scaling.Enabled = !plume;
+        _gpu.Enabled = !plume;
+        _msaa.Enabled = plume;
+        UpdatePreview();
+    }
 
     /// <summary>Keeps the GPU list in step with the selected graphics API.</summary>
     private void OnApiChanged()
@@ -454,6 +492,9 @@ public sealed class MainForm : Form
         _api.SelectedIndex = -1;
         _api.SelectedIndex = api >= 0 ? api : 0;
         _gpuSource = null;
+        _msaa.SelectedIndex = IndexOf(MsaaOptions, s.Msaa, 1);
+        _renderer.SelectedIndex = IndexOf(RendererOptions, s.Renderer, 0);
+        OnRendererChanged();
 
         _language.SelectedIndex = IndexOf(LanguageOptions, s.Language, 0);
         _saveFolder.Text = s.SaveFolder;
@@ -482,6 +523,8 @@ public sealed class MainForm : Form
         s.KeepAspectRatio = _keepAspect.Checked;
         s.GraphicsApi = SelectedApi;
         if (_gpuListApi != null) StoreGpuSelection(s, _gpuListApi);
+        s.Renderer = RendererOptions[Math.Max(0, _renderer.SelectedIndex)].Value;
+        s.Msaa = MsaaOptions[Math.Max(0, _msaa.SelectedIndex)].Value;
 
         s.Language = LanguageOptions[_language.SelectedIndex].Value;
         s.SaveFolder = _saveFolder.Text.Trim();
@@ -627,8 +670,21 @@ public sealed class MainForm : Form
         args.Add(Flag("fullscreen", s.Fullscreen));
         args.Add($"--window_width={s.WindowWidth}");
         args.Add($"--window_height={s.WindowHeight}");
-        args.Add($"--resolution_scale={s.ResolutionScale}");
         args.Add(Flag("vsync", s.VSync));
+        if (s.Renderer == "plume")
+        {
+            // The native renderer has its own options.
+            args.Add("--renderer=plume");
+            args.Add($"--plume_backend={s.GraphicsApi}");
+            args.Add($"--plume_resolution_scale={s.ResolutionScale}");
+            args.Add($"--plume_msaa={s.Msaa}");
+            args.Add(Flag("plume_vsync", s.VSync));
+            args.Add($"--plume_anisotropic={s.Anisotropic}");
+            args.Add(Flag("plume_letterbox", s.KeepAspectRatio));
+            AddCommonArguments(args, s);
+            return string.Join(' ', args);
+        }
+        args.Add($"--resolution_scale={s.ResolutionScale}");
         // "vsync" only paces the game; these keep the host presentation from tearing too.
         // Without VSync both renderers present as soon as possible (tearing, VRR).
         args.Add(Flag("d3d12_allow_variable_refresh_rate_and_tearing", !s.VSync));
@@ -647,7 +703,13 @@ public sealed class MainForm : Form
         {
             args.Add($"--d3d12_adapter={s.GpuAdapter}");
         }
+        AddCommonArguments(args, s);
+        return string.Join(' ', args);
+    }
 
+    /// <summary>The arguments that don't depend on the renderer.</summary>
+    private static void AddCommonArguments(List<string> args, Settings s)
+    {
         args.Add($"--user_language={s.Language}");
         args.Add(Flag("mnk_mode", s.KeyboardControls));
         args.AddRange(ControlsPage.Arguments(s));
@@ -656,7 +718,6 @@ public sealed class MainForm : Form
         if (s.UnlockAllCostumes) args.Add("--cheat_unlock_costumes");
 
         if (!string.IsNullOrWhiteSpace(s.ExtraArguments)) args.Add(s.ExtraArguments);
-        return string.Join(' ', args);
     }
 
     private void Launch()

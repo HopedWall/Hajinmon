@@ -18,6 +18,10 @@ public sealed class Settings
     /// <summary>present_effect: bilinear, cas, fsr.</summary>
     public string ScalingFilter { get; set; } = "bilinear";
     public bool KeepAspectRatio { get; set; } = true;
+    /// <summary>renderer: xenia (Xenos emulation) or plume (native, experimental).</summary>
+    public string Renderer { get; set; } = "xenia";
+    /// <summary>plume_msaa: samples per pixel of the MSAA surfaces (native renderer).</summary>
+    public int Msaa { get; set; } = 4;
     /// <summary>gpu_backend: d3d12 or vulkan.</summary>
     public string GraphicsApi { get; set; } = "d3d12";
     /// <summary>d3d12_adapter: -1 = automatic (high-performance GPU).</summary>
