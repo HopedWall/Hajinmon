@@ -19,6 +19,8 @@ REXCVAR_DEFINE_INT32(plume_anisotropic, -1, "GPU/Plume",
                      "Native renderer anisotropic filtering: -1 as the game sets it, 0 off, 2 2x, "
                      "3 4x, 4 8x, 5 16x")
     .range(-1, 5);
+REXCVAR_DEFINE_INT32(plume_texture_max_levels, 16, "GPU/Plume",
+                     "Debugging: maximum mip levels loaded per texture");
 
 namespace hajinmon::renderer {
 
@@ -400,7 +402,8 @@ bool TextureCache::Load(Texture& texture, const xenos::xe_gpu_texture_fetch_t& f
   // are left out (they can't be copied as whole blocks on the host).
   uint32_t level_count = 1;
   if (mip_page) {
-    while (level_count <= mip_max) {
+    uint32_t max_levels = uint32_t(std::max(REXCVAR_GET(plume_texture_max_levels), 1));
+    while (level_count <= mip_max && level_count < max_levels) {
       uint32_t level_width = std::max(width >> level_count, 1u);
       uint32_t level_height = std::max(height >> level_count, 1u);
       if ((block_width > 1 && level_width < block_width) ||
@@ -480,10 +483,13 @@ bool TextureCache::Load(Texture& texture, const xenos::xe_gpu_texture_fetch_t& f
   for (uint32_t level = 0; level < level_count; ++level) {
     // Levels from the packed one on are in the packed mip tail.
     uint32_t stored_level = std::min(level, layout.packed_level);
+    // With the base level in the packed mip tail (small textures), all the
+    // levels are in the base memory.
+    bool in_mips = level && layout.packed_level != 0;
     const texture_util::TextureGuestLayout::Level& level_layout =
-        level ? layout.mips[stored_level] : layout.base;
-    const std::vector<uint8_t>& data = guest[level ? 1 : 0];
-    uint32_t level_offset = level ? layout.mip_offsets_bytes[stored_level] : 0;
+        in_mips ? layout.mips[stored_level] : layout.base;
+    const std::vector<uint8_t>& data = guest[in_mips ? 1 : 0];
+    uint32_t level_offset = in_mips ? layout.mip_offsets_bytes[stored_level] : 0;
     uint32_t offset_x = 0, offset_y = 0, offset_z = 0;
     if (level >= layout.packed_level) {
       texture_util::GetPackedMipOffset(width, height, depth, format, level, offset_x, offset_y,
