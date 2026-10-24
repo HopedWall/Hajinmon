@@ -46,6 +46,9 @@ class PipelineCache {
     uint32_t cull_mode;
     uint32_t sample_count;
     bool alpha_to_coverage;
+    // Polygon offset, in host depth units and host pixels.
+    int32_t depth_bias;
+    float depth_bias_slope_scaled;
   };
   // Returns null if the pipeline can't be created.
   plume::RenderPipeline* GetPipeline(const Description& description,

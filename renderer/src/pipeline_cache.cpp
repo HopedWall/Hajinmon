@@ -2,6 +2,8 @@
 
 #include "pipeline_cache.h"
 
+#include <bit>
+
 #include <rex/logging/macros.h>
 #include <xxhash.h>
 
@@ -165,6 +167,7 @@ plume::RenderPipeline* PipelineCache::GetPipeline(const Description& d,
       uint64_t(d.depth_control) | (uint64_t(d.stencil_ref_mask) << 32),
       uint64_t(d.stencil_ref_mask_bf) | (uint64_t(d.sample_count) << 32) |
           (uint64_t(d.alpha_to_coverage) << 40),
+      uint64_t(uint32_t(d.depth_bias)) | (uint64_t(std::bit_cast<uint32_t>(d.depth_bias_slope_scaled)) << 32),
   };
   uint64_t key = XXH3_64bits(fields, sizeof(fields));
   auto it = pipelines_.find(key);
@@ -250,6 +253,8 @@ plume::RenderPipeline* PipelineCache::GetPipeline(const Description& d,
                                       : plume::RenderCullMode::NONE;
   desc.frontFace = (d.cull_mode & 4) ? plume::RenderFrontFace::CLOCKWISE
                                      : plume::RenderFrontFace::COUNTER_CLOCKWISE;
+  desc.depthBias = d.depth_bias;
+  desc.slopeScaledDepthBias = d.depth_bias_slope_scaled;
 
   auto pipeline = renderer_.device()->createGraphicsPipeline(desc);
   if (!pipeline) {

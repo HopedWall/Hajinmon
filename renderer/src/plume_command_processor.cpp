@@ -366,6 +366,18 @@ bool PlumeCommandProcessor::Draw() {
     }
     description.cull_mode = mode.cull_front | (mode.cull_back << 1) | (mode.face << 2);
   }
+  // Polygon offset (coplanar geometry such as decals and layered scenery), as
+  // in the SDK: the face that is drawn, in Direct3D integer units for the
+  // guest depth format, and the slope for host pixels.
+  if (targets.depth) {
+    float polygon_offset_scale, polygon_offset;
+    draw_util::GetPreferredFacePolygonOffset(regs, polygonal, polygon_offset_scale, polygon_offset);
+    description.depth_bias = draw_util::GetD3D10IntegerPolygonOffset(
+        regs.Get<reg::RB_DEPTH_INFO>().depth_format, polygon_offset);
+    description.depth_bias_slope_scaled = polygon_offset_scale *
+                                          xenos::kPolygonOffsetScaleSubpixelUnit *
+                                          float(render_target_cache_->scale());
+  }
   plume::RenderPipeline* pipeline =
       pipeline_cache_->GetPipeline(description, *vertex_compiled, pixel_compiled);
   if (!pipeline) {
