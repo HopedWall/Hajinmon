@@ -269,9 +269,19 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& l
 }
 
 uint32_t TextureCache::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
-  // Anisotropic filtering: the game's, or the plume_anisotropic override.
-  uint32_t aniso = REXCVAR_GET(plume_anisotropic) >= 0 ? uint32_t(REXCVAR_GET(plume_anisotropic))
-                                                        : uint32_t(fetch.aniso_filter);
+  // Anisotropic filtering: the game's, or the plume_anisotropic override. As in
+  // the SDK, the override only applies to linearly filtered textures with
+  // mips: forcing it on the others (lookup tables, the character select
+  // thumbnails) blurs what the game samples exactly.
+  uint32_t aniso = uint32_t(fetch.aniso_filter);
+  bool override_eligible = fetch.mip_max_level > fetch.mip_min_level &&
+                           fetch.mag_filter == xenos::TextureFilter::kLinear &&
+                           fetch.min_filter == xenos::TextureFilter::kLinear &&
+                           (fetch.mip_filter == xenos::TextureFilter::kPoint ||
+                            fetch.mip_filter == xenos::TextureFilter::kLinear);
+  if (REXCVAR_GET(plume_anisotropic) >= 0 && override_eligible) {
+    aniso = uint32_t(REXCVAR_GET(plume_anisotropic));
+  }
   uint32_t key = uint32_t(fetch.clamp_x) | (uint32_t(fetch.clamp_y) << 3) |
                  (uint32_t(fetch.clamp_z) << 6) | (uint32_t(fetch.mag_filter) << 9) |
                  (uint32_t(fetch.min_filter) << 11) | (uint32_t(fetch.mip_filter) << 13) |
