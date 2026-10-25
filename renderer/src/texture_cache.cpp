@@ -346,11 +346,24 @@ TextureCache::Texture* TextureCache::GetTexture(const xenos::xe_gpu_texture_fetc
                  (uint64_t(fetch.swizzle) << 50);
   std::unique_ptr<Texture>& texture = textures_[key];
   if (!texture) {
-    if (next_texture_index_ >= kMaxTextures) {
+    uint32_t index = 0;
+    uint64_t frame = renderer_.frame_number();
+    if (!free_indices_.empty() &&
+        free_indices_.front().second + PlumeRenderer::kFramesInFlight + 1 <= frame) {
+      index = free_indices_.front().first;
+      free_indices_.erase(free_indices_.begin());
+    } else if (next_texture_index_ < kMaxTextures) {
+      index = next_texture_index_++;
+    } else {
+      if (!out_of_indices_logged_) {
+        out_of_indices_logged_ = true;
+        REXLOG_WARN("Plume: out of texture indices ({} textures), new textures are black", textures_.size());
+      }
+      textures_.erase(key);
       return nullptr;
     }
     texture = std::make_unique<Texture>();
-    texture->index = next_texture_index_++;
+    texture->index = index;
   }
   return texture.get();
 }
@@ -591,8 +604,10 @@ void TextureCache::Bind(const xenos::xe_gpu_texture_fetch_t& fetch,
   }
   Texture* texture = GetTexture(fetch);
   if (!texture) {
+    ++placeholders_[4];
     return;
   }
+  texture->last_used_frame = renderer_.frame_number();
   plume::RenderCommandList* list = renderer_.command_list();
 
   // Rendered by the game: copy from the resolve result.
@@ -667,10 +682,36 @@ void TextureCache::Bind(const xenos::xe_gpu_texture_fetch_t& fetch,
   swizzle_out = texture->swizzle;
 }
 
+void TextureCache::EndFrame() {
+  loads_ = 0;
+  // Every 2 seconds, the textures unused for 10 seconds are released. Cube
+  // maps are kept (their views can't be released with the frame).
+  uint64_t frame = renderer_.frame_number();
+  if (frame % 120) {
+    return;
+  }
+  for (auto it = textures_.begin(); it != textures_.end();) {
+    Texture& texture = *it->second;
+    if (texture.view || texture.last_used_frame + 600 > frame) {
+      ++it;
+      continue;
+    }
+    for (void*& watch : texture.watches) {
+      if (watch) {
+        shared_memory_.UnwatchMemoryRange(watch);
+        watch = nullptr;
+      }
+    }
+    renderer_.Retire(std::move(texture.texture.texture));
+    free_indices_.emplace_back(texture.index, frame);
+    it = textures_.erase(it);
+  }
+}
+
 std::string TextureCache::TakePlaceholderStats() {
   std::string stats;
-  static const char* const kReasons[] = {"invalid", "3D", "cube", "not loaded"};
-  for (uint32_t i = 0; i < 4; ++i) {
+  static const char* const kReasons[] = {"invalid", "3D", "cube", "not loaded", "no index"};
+  for (uint32_t i = 0; i < 5; ++i) {
     if (placeholders_[i]) {
       stats += fmt::format(" {} {},", kReasons[i], placeholders_[i]);
     }

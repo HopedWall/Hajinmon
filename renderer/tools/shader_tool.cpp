@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <fmt/format.h>
+#include <xxhash.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/string/buffer.h>
 
@@ -97,7 +98,10 @@ int main(int argc, char** argv) {
     spirv_ok += spirv;
 
     if (dump_all || !valid || !dxil || !spirv) {
-      std::string name = fmt::format("{}_{:08X}", entry.is_vertex_shader ? "vs" : "ps", entry.ucode_address);
+      // The address, and the hash the renderer logs shaders by.
+      std::string name = fmt::format("{}_{:08X}_{:016X}", entry.is_vertex_shader ? "vs" : "ps",
+                                     entry.ucode_address,
+                                     XXH3_64bits(ucode, entry.ucode_dword_count * sizeof(uint32_t)));
       std::ofstream out(out_dir / (name + ".hlsl"), std::ios::binary);
       out << "/*\n" << disassembly.to_string_view() << "\n" << messages << "*/\n" << hlsl;
       if (!valid || !dxil || !spirv) {

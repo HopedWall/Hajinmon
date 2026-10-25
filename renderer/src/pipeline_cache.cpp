@@ -3,13 +3,56 @@
 #include "pipeline_cache.h"
 
 #include <bit>
+#include <chrono>
+#include <cstring>
+#include <fstream>
 
 #include <rex/logging/macros.h>
 #include <xxhash.h>
 
 #include "texture_cache.h"
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace hajinmon::renderer {
+
+namespace {
+
+struct PipelineCreation {
+  plume::RenderDevice* device;
+  const plume::RenderGraphicsPipelineDesc* desc;
+  std::unique_ptr<plume::RenderPipeline> pipeline;
+};
+
+void CreatePipeline(void* context) {
+  auto* creation = static_cast<PipelineCreation*>(context);
+  creation->pipeline = creation->device->createGraphicsPipeline(*creation->desc);
+}
+
+// Runs `function`, returning false if it crashed. Some drivers crash while
+// compiling certain shaders when the pipeline is created (the AMD Direct3D 12
+// driver on Radeon 890M): the draws using it are skipped instead of the game
+// closing. No C++ objects here, as structured exception handling requires.
+bool CallGuarded(void (*function)(void*), void* context) {
+#ifdef _WIN32
+  __try {
+    function(context);
+  } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                               : EXCEPTION_CONTINUE_SEARCH) {
+    return false;
+  }
+#else
+  function(context);
+#endif
+  return true;
+}
+
+}  // namespace
 
 namespace xenos = rex::graphics::xenos;
 namespace reg = rex::graphics::reg;
@@ -136,13 +179,80 @@ bool PipelineCache::Initialize() {
   return layout_ && rectangle_list_shader_;
 }
 
+PipelineCache::~PipelineCache() { StopPrewarm(); }
+
+void PipelineCache::StopPrewarm() {
+  prewarm_stop_ = true;
+  if (prewarm_thread_.joinable()) {
+    prewarm_thread_.join();
+  }
+}
+
+void PipelineCache::StartPrewarm(const std::filesystem::path& directory, ShaderCache& shader_cache) {
+  StopPrewarm();
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    record_path_ = directory.empty() ? std::filesystem::path() : directory / "pipelines.bin";
+  }
+  // Records: version, size, description. Descriptions of another layout
+  // (an older build) are skipped.
+  std::vector<Description> recorded;
+  std::ifstream file(record_path_, std::ios::binary);
+  uint32_t header[2];
+  while (file.read(reinterpret_cast<char*>(header), sizeof(header))) {
+    if (header[1] > 4096) {
+      break;
+    }
+    Description description = {};
+    std::vector<char> data(header[1]);
+    if (!file.read(data.data(), header[1])) {
+      break;
+    }
+    if (header[0] == kRecordVersion && header[1] == sizeof(Description)) {
+      std::memcpy(&description, data.data(), sizeof(Description));
+      recorded.push_back(description);
+    }
+  }
+  REXLOG_INFO("Plume: {} pipelines recorded in previous sessions", recorded.size());
+  if (recorded.empty()) {
+    return;
+  }
+  prewarm_stop_ = false;
+  prewarm_thread_ = std::thread([this, recorded = std::move(recorded), &shader_cache] {
+    auto start = std::chrono::steady_clock::now();
+    uint32_t created = 0, skipped = 0;
+    for (const Description& description : recorded) {
+      if (prewarm_stop_) {
+        return;
+      }
+      // The shader prewarm (running at the same time) provides the shaders.
+      const CompiledShader* vertex = shader_cache.Wait(description.vertex_shader, std::chrono::seconds(20));
+      const CompiledShader* pixel =
+          description.pixel_shader ? shader_cache.Wait(description.pixel_shader, std::chrono::seconds(20))
+                                   : nullptr;
+      if (!vertex || !vertex->is_valid || (description.pixel_shader && (!pixel || !pixel->is_valid))) {
+        ++skipped;
+        continue;
+      }
+      if (GetPipeline(description, *vertex, pixel)) {
+        ++created;
+      }
+    }
+    REXLOG_INFO("Plume: pipeline prewarm done in {:.1f} s ({} ready, {} without shaders)",
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), created,
+                skipped);
+  });
+}
+
 void PipelineCache::Shutdown() {
+  StopPrewarm();
   pipelines_.clear();
   shaders_.clear();
   rectangle_list_shader_.reset();
   layout_.reset();
 }
 
+// Called with mutex_ held.
 plume::RenderShader* PipelineCache::GetShader(uint64_t hash, const CompiledShader& compiled) {
   std::unique_ptr<plume::RenderShader>& shader = shaders_[hash];
   if (!shader) {
@@ -170,10 +280,19 @@ plume::RenderPipeline* PipelineCache::GetPipeline(const Description& d,
       uint64_t(uint32_t(d.depth_bias)) | (uint64_t(std::bit_cast<uint32_t>(d.depth_bias_slope_scaled)) << 32),
   };
   uint64_t key = XXH3_64bits(fields, sizeof(fields));
-  auto it = pipelines_.find(key);
-  if (it != pipelines_.end()) {
-    return it->second.get();
+  std::unique_lock<std::mutex> lock(mutex_);
+  for (;;) {
+    auto it = pipelines_.find(key);
+    if (it != pipelines_.end()) {
+      return it->second.get();
+    }
+    if (!creating_.count(key)) {
+      break;
+    }
+    // Being created by another thread (the prewarm).
+    created_condition_.wait(lock);
   }
+  creating_.insert(key);
 
   plume::RenderGraphicsPipelineDesc desc;
   desc.pipelineLayout = layout_.get();
@@ -256,13 +375,30 @@ plume::RenderPipeline* PipelineCache::GetPipeline(const Description& d,
   desc.depthBias = d.depth_bias;
   desc.slopeScaledDepthBias = d.depth_bias_slope_scaled;
 
-  auto pipeline = renderer_.device()->createGraphicsPipeline(desc);
-  if (!pipeline) {
+  lock.unlock();
+  PipelineCreation creation{renderer_.device(), &desc, nullptr};
+  if (!CallGuarded(CreatePipeline, &creation)) {
+    // Remembered as failed (null) so it is not tried again.
+    REXLOG_ERROR("Plume: the graphics driver crashed creating a pipeline for shaders {:016X} / "
+                 "{:016X} ({} samples, primitive {}), its draws are skipped",
+                 d.vertex_shader, d.pixel_shader, d.sample_count, uint32_t(d.primitive_type));
+  } else if (!creation.pipeline) {
     REXLOG_ERROR("Plume: could not create a pipeline for shaders {:016X} / {:016X}", d.vertex_shader,
                  d.pixel_shader);
   }
-  plume::RenderPipeline* result = pipeline.get();
-  pipelines_.emplace(key, std::move(pipeline));
+  plume::RenderPipeline* result = creation.pipeline.get();
+  lock.lock();
+  if (result && !record_path_.empty()) {
+    // Recorded for the prewarm of later sessions.
+    std::ofstream file(record_path_, std::ios::binary | std::ios::app);
+    uint32_t header[2] = {kRecordVersion, uint32_t(sizeof(Description))};
+    file.write(reinterpret_cast<const char*>(header), sizeof(header));
+    file.write(reinterpret_cast<const char*>(&d), sizeof(Description));
+  }
+  pipelines_.emplace(key, std::move(creation.pipeline));
+  creating_.erase(key);
+  lock.unlock();
+  created_condition_.notify_all();
   return result;
 }
 

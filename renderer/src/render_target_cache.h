@@ -56,6 +56,10 @@ class RenderTargetCache {
   // the draw needs. Binding sizes are in host pixels (scaled).
   bool Update(const rex::graphics::RegisterFile& regs, uint32_t color_mask, bool use_depth,
               uint32_t height, Binding& binding_out);
+  // Why Update failed, counted for the statistics: no surface pitch, a color
+  // or depth target that couldn't be created, nothing to write to.
+  enum SkipReason { kSkipNoPitch, kSkipColorTarget, kSkipDepthTarget, kSkipNoTargets, kSkipReasonCount };
+  uint64_t skip_reasons[kSkipReasonCount] = {};
 
   // Performs the copy and clears of a resolve.
   void Resolve(const rex::graphics::RegisterFile& regs,

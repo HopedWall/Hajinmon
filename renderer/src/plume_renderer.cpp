@@ -20,6 +20,9 @@
 #if defined(__linux__)
 #include <SDL3/SDL.h>
 #endif
+#if defined(_WIN32)
+#include <timeapi.h>
+#endif
 
 REXCVAR_DEFINE_STRING(plume_backend, "auto", "GPU/Plume",
                       "Graphics API of the native renderer: auto, d3d12, vulkan")
@@ -32,6 +35,12 @@ REXCVAR_DEFINE_BOOL(plume_letterbox, true, "GPU/Plume",
 REXCVAR_DEFINE_INT32(plume_resolution_scale, 2, "GPU/Plume",
                      "Native renderer resolution scale (1 = 1280x720, 2 = 2560x1440...)")
     .range(1, 4)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(plume_skip_present, false, "GPU/Plume",
+                    "Debugging: render every frame but never present it (the window stays black)");
+REXCVAR_DEFINE_BOOL(plume_gpu_profile, false, "GPU/Plume",
+                    "Debugging: log the GPU time per render target, resolve and presentation "
+                    "(exact, but serializes the GPU)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(plume_capture_path, "", "GPU/Plume",
                       "Debugging: directory to save presented frames to as PNG (empty: off)");
@@ -52,6 +61,7 @@ namespace {
 constexpr plume::RenderFormat kSwapChainFormat = plume::RenderFormat::B8G8R8A8_UNORM;
 constexpr uint32_t kSwapChainImages = 3;
 constexpr uint64_t kUploadChunkSize = 16 << 20;
+constexpr uint32_t kMaxQueries = 1024;
 
 const char kPresentShaders[] = R"(
 struct PresentConstants {
@@ -116,6 +126,13 @@ PlumeRenderer::PlumeRenderer() = default;
 PlumeRenderer::~PlumeRenderer() { Shutdown(); }
 
 bool PlumeRenderer::Initialize() {
+#if defined(_WIN32)
+  // 1 ms timer resolution: some drivers (AMD Vulkan) wait for fences by
+  // sleeping, which with the default 15.6 ms resolution turns a short wait for
+  // the previous frame into a missed frame.
+  timer_period_set_ = timeBeginPeriod(1) == TIMERR_NOERROR;
+  REXLOG_INFO("Plume: 1 ms timer resolution {}", timer_period_set_ ? "set" : "not available");
+#endif
   std::string backend = REXCVAR_GET(plume_backend);
 #if defined(_WIN32)
   if (backend == "auto" || backend == "d3d12") {
@@ -140,15 +157,23 @@ bool PlumeRenderer::Initialize() {
   queue_ = device_->createCommandQueue(plume::RenderCommandListType::DIRECT);
   for (Frame& frame : frames_) {
     frame.command_list = queue_->createCommandList();
+    frame.upload_list = queue_->createCommandList();
     frame.fence = device_->createCommandFence();
+    frame.queries = device_->createQueryPool(kMaxQueries);
     frame.constants = device_->createBuffer(
         plume::RenderBufferDesc::UploadBuffer(kConstantMemorySize, plume::RenderBufferFlag::STORAGE));
     frame.constants_data = static_cast<uint8_t*>(frame.constants->map());
   }
-  acquire_semaphore_ = device_->createCommandSemaphore();
+  for (auto& semaphore : acquire_semaphores_) {
+    semaphore = device_->createCommandSemaphore();
+  }
   if (!CreatePresentPipeline()) {
     REXLOG_ERROR("Plume: could not create the present pipeline");
     return false;
+  }
+  profiling_ = REXCVAR_GET(plume_gpu_profile);
+  if (profiling_) {
+    profile_buffer_ = device_->createBuffer(plume::RenderBufferDesc::DefaultBuffer(256));
   }
   REXLOG_INFO("Plume: {} device created", backend_name_);
   return true;
@@ -164,6 +189,12 @@ void PlumeRenderer::WaitForIdle() {
 }
 
 void PlumeRenderer::Shutdown() {
+#if defined(_WIN32)
+  if (timer_period_set_) {
+    timeEndPeriod(1);
+    timer_period_set_ = false;
+  }
+#endif
   if (!device_) {
     return;
   }
@@ -185,7 +216,9 @@ void PlumeRenderer::Shutdown() {
     }
     frame = Frame();
   }
-  acquire_semaphore_.reset();
+  for (auto& semaphore : acquire_semaphores_) {
+    semaphore.reset();
+  }
   queue_.reset();
   device_.reset();
   interface_.reset();
@@ -276,6 +309,8 @@ bool PlumeRenderer::EnsureSwapChain() {
     }
     swap_chain_->setVsyncEnabled(REXCVAR_GET(plume_vsync));
     swap_chain_->resize();
+    REXLOG_INFO("Plume: swap chain {}x{}, {}", swap_chain_->getWidth(), swap_chain_->getHeight(),
+                swap_chain_->isVsyncEnabled() ? "waiting for the vertical blank" : "presenting immediately");
   } else if (swap_chain_->needsResize()) {
     WaitForIdle();
     framebuffers_.clear();
@@ -304,9 +339,18 @@ plume::RenderCommandList* PlumeRenderer::command_list() {
   Frame& frame = frames_[frame_slot_];
   if (!frame_open_) {
     if (frame.submitted) {
+      auto wait_start = std::chrono::steady_clock::now();
       queue_->waitForCommandFence(frame.fence.get());
+      auto wait_end = std::chrono::steady_clock::now();
+      gpu_wait_time_ += wait_end - wait_start;
+      if (wait_end - wait_start > std::chrono::microseconds(100)) {
+        ++gpu_times_.latency_frames;
+        gpu_times_.latency_ns += uint64_t(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(wait_end - frame.submit_time).count());
+      }
       frame.submitted = false;
     }
+    CollectGpuTimes(frame);
     frame.retired_textures.clear();
     frame.retired_framebuffers.clear();
     frame.upload_chunk = 0;
@@ -314,8 +358,132 @@ plume::RenderCommandList* PlumeRenderer::command_list() {
     frame.constants_offset = 0;
     frame.command_list->begin();
     frame_open_ = true;
+    if (frame.queries) {
+      frame.command_list->resetQueryPool(frame.queries.get(), 0, kMaxQueries);
+      frame.command_list->writeTimestamp(frame.queries.get(), 0);
+      frame.query_count = 1;
+    }
   }
   return frame.command_list.get();
+}
+
+uint32_t PlumeRenderer::WriteTimestamp() {
+  plume::RenderCommandList* list = command_list();
+  Frame& frame = frames_[frame_slot_];
+  // Two left for the presentation.
+  if (!frame.queries || frame.query_count + 2 >= kMaxQueries) {
+    return UINT32_MAX;
+  }
+  list->writeTimestamp(frame.queries.get(), frame.query_count);
+  return frame.query_count++;
+}
+
+void PlumeRenderer::ProfileBarrier(plume::RenderCommandList* list) {
+  // Ends the render pass and waits for everything before (on Vulkan, a
+  // timestamp inside a render pass may be written before the earlier passes
+  // finish).
+  list->barriers(plume::RenderBarrierStage::ALL,
+                 plume::RenderBufferBarrier(profile_buffer_.get(), plume::RenderBufferAccess::READ));
+}
+
+void PlumeRenderer::ProfileMark(std::string_view label) {
+  if (!profiling_) {
+    return;
+  }
+  plume::RenderCommandList* list = command_list();
+  Frame& frame = frames_[frame_slot_];
+  if (!frame.queries || frame.query_count + 2 >= kMaxQueries) {
+    return;
+  }
+  auto it = profile_label_ids_.find(std::string(label));
+  uint32_t id;
+  if (it == profile_label_ids_.end()) {
+    id = uint32_t(profile_labels_.size());
+    profile_label_ids_.emplace(std::string(label), id);
+    profile_labels_.emplace_back(label);
+    profile_ns_.push_back(0);
+    profile_counts_.push_back(0);
+  } else {
+    id = it->second;
+  }
+  ProfileBarrier(list);
+  list->writeTimestamp(frame.queries.get(), frame.query_count);
+  frame.profile_marks.emplace_back(frame.query_count++, id);
+}
+
+std::string PlumeRenderer::TakeProfile() {
+  std::string text;
+  if (!profile_frames_) {
+    return text;
+  }
+  std::vector<uint32_t> order(profile_labels_.size());
+  for (uint32_t i = 0; i < order.size(); ++i) {
+    order[i] = i;
+  }
+  std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return profile_ns_[a] > profile_ns_[b]; });
+  double frames = double(profile_frames_);
+  for (size_t i = 0; i < order.size() && i < 12; ++i) {
+    uint32_t id = order[i];
+    if (!profile_ns_[id]) {
+      break;
+    }
+    text += fmt::format("\n  {:.2f} ms  {:.1f}x  {}", double(profile_ns_[id]) / 1e6 / frames,
+                        double(profile_counts_[id]) / frames, profile_labels_[id]);
+  }
+  std::fill(profile_ns_.begin(), profile_ns_.end(), 0);
+  std::fill(profile_counts_.begin(), profile_counts_.end(), 0);
+  profile_frames_ = 0;
+  return text;
+}
+
+void PlumeRenderer::AddResolveTime(uint32_t begin, uint32_t end) {
+  if (begin != UINT32_MAX && end != UINT32_MAX) {
+    frames_[frame_slot_].resolve_queries.emplace_back(begin, end);
+  }
+}
+
+void PlumeRenderer::CollectGpuTimes(Frame& frame) {
+  if (!frame.queries_pending) {
+    return;
+  }
+  frame.queries_pending = false;
+  frame.queries->queryResults();
+  const uint64_t* results = frame.queries->getResults();
+  auto span = [&](uint32_t begin, uint32_t end) -> uint64_t {
+    return results[end] > results[begin] ? results[end] - results[begin] : 0;
+  };
+  uint32_t last = frame.query_count - 1;
+  ++gpu_times_.frames;
+  gpu_times_.frame_ns += span(0, last);
+  for (const auto& [begin, end] : frame.resolve_queries) {
+    gpu_times_.resolve_ns += span(begin, end);
+  }
+  if (frame.present_query != UINT32_MAX) {
+    gpu_times_.present_ns += span(frame.present_query, last);
+  }
+  if (!frame.profile_marks.empty()) {
+    ++profile_frames_;
+    for (size_t i = 0; i < frame.profile_marks.size(); ++i) {
+      uint32_t end = i + 1 < frame.profile_marks.size() ? frame.profile_marks[i + 1].first
+                                                        : (frame.present_query != UINT32_MAX ? frame.present_query : last);
+      uint32_t id = frame.profile_marks[i].second;
+      profile_ns_[id] += span(frame.profile_marks[i].first, end);
+      ++profile_counts_[id];
+    }
+    frame.profile_marks.clear();
+  }
+  frame.resolve_queries.clear();
+  frame.present_query = UINT32_MAX;
+}
+
+plume::RenderCommandList* PlumeRenderer::upload_command_list() {
+  command_list();
+  Frame& frame = frames_[frame_slot_];
+  if (!frame.upload_list_open) {
+    frame.upload_list->begin();
+    frame.upload_list_open = true;
+  }
+  return frame.upload_list.get();
 }
 
 void PlumeRenderer::Retire(std::unique_ptr<plume::RenderTexture> texture) {
@@ -375,9 +543,16 @@ bool PlumeRenderer::EndFrame(TrackedTexture* source, uint32_t width, uint32_t he
                              bool swap_red_blue) {
   plume::RenderCommandList* list = command_list();
   Frame& frame = frames_[frame_slot_];
-  bool presenting = EnsureSwapChain();
+  if (frame.queries) {
+    if (profiling_) {
+      ProfileBarrier(list);
+    }
+    frame.present_query = frame.query_count;
+    list->writeTimestamp(frame.queries.get(), frame.query_count++);
+  }
+  bool presenting = !REXCVAR_GET(plume_skip_present) && EnsureSwapChain();
   uint32_t image = 0;
-  if (presenting && !swap_chain_->acquireTexture(acquire_semaphore_.get(), &image)) {
+  if (presenting && !swap_chain_->acquireTexture(acquire_semaphores_[frame_slot_].get(), &image)) {
     presenting = false;
   }
   if (presenting) {
@@ -436,18 +611,33 @@ bool PlumeRenderer::EndFrame(TrackedTexture* source, uint32_t width, uint32_t he
                                                           height, 1, capture_row / 4),
         plume::RenderTextureCopyLocation::Subresource(source->texture.get()), 0, 0, 0, &box);
   }
+  if (frame.queries) {
+    if (profiling_) {
+      ProfileBarrier(list);
+    }
+    list->writeTimestamp(frame.queries.get(), frame.query_count++);
+    frame.queries_pending = true;
+  }
   list->end();
 
-  const plume::RenderCommandList* lists = list;
+  const plume::RenderCommandList* lists[2];
+  uint32_t list_count = 0;
+  if (frame.upload_list_open) {
+    frame.upload_list->end();
+    frame.upload_list_open = false;
+    lists[list_count++] = frame.upload_list.get();
+  }
+  lists[list_count++] = list;
   if (presenting) {
-    plume::RenderCommandSemaphore* wait = acquire_semaphore_.get();
+    plume::RenderCommandSemaphore* wait = acquire_semaphores_[frame_slot_].get();
     plume::RenderCommandSemaphore* signal = release_semaphores_[image].get();
-    queue_->executeCommandLists(&lists, 1, &wait, 1, &signal, 1, frame.fence.get());
+    queue_->executeCommandLists(lists, list_count, &wait, 1, &signal, 1, frame.fence.get());
     swap_chain_->present(image, &signal, 1);
   } else {
-    queue_->executeCommandLists(&lists, 1, nullptr, 0, nullptr, 0, frame.fence.get());
+    queue_->executeCommandLists(lists, list_count, nullptr, 0, nullptr, 0, frame.fence.get());
   }
   frame.submitted = true;
+  frame.submit_time = std::chrono::steady_clock::now();
   if (capture) {
     queue_->waitForCommandFence(frame.fence.get());
     frame.submitted = false;

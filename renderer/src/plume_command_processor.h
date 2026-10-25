@@ -105,6 +105,26 @@ class PlumeCommandProcessor : public rex::graphics::CommandProcessor {
   };
   BlockState blocks_[kBlockCount];
 
+  // What the draws last set on the command list, to set only what changes.
+  // Reset when the list is reopened and after resolves and presentation,
+  // which set their own state. On Vulkan, keeping the framebuffer also keeps
+  // the render pass open across draws.
+  struct BoundState {
+    uint64_t frame = UINT64_MAX;
+    const plume::RenderFramebuffer* framebuffer = nullptr;
+    const plume::RenderPipeline* pipeline = nullptr;
+    bool layout = false;
+    bool push_valid = false;
+    uint32_t push[8] = {};
+    bool viewport_valid = false;
+    plume::RenderViewport viewport;
+    bool scissor_valid = false;
+    plume::RenderRect scissor;
+    bool index_valid = false;
+    plume::RenderIndexBufferView index;
+  };
+  BoundState bound_;
+
   // Statistics, logged every few seconds.
   uint64_t frames_ = 0;
   uint64_t draws_ = 0;
@@ -112,6 +132,11 @@ class PlumeCommandProcessor : public rex::graphics::CommandProcessor {
   uint64_t copies_ = 0;
   uint64_t presented_ = 0;
   uint64_t skipped_[kSkipCount] = {};
+  // Time on the GPU thread: draws, resolves, and the end of frame (submission
+  // and presentation).
+  std::chrono::nanoseconds draw_time_{0};
+  std::chrono::nanoseconds copy_time_{0};
+  std::chrono::nanoseconds swap_time_{0};
   std::chrono::steady_clock::time_point stats_start_;
 };
 

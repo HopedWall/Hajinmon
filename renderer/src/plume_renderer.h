@@ -12,6 +12,10 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <string>
+#include <unordered_map>
+#include <utility>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -80,7 +84,41 @@ class PlumeRenderer {
   // The command list of the current frame, opened on first use (waiting for
   // the GPU to finish the frame that last used its resources).
   plume::RenderCommandList* command_list();
+  // A command list of the current frame that the GPU executes before
+  // command_list (for uploads that must come before all of the frame's draws).
+  // Record into it only at the end of the frame, after command_list, so the
+  // resource states tracked by Plume are those at the start of the frame.
+  plume::RenderCommandList* upload_command_list();
   uint32_t frame_slot() const { return frame_slot_; }
+  // Time spent waiting for the GPU to finish earlier frames since the last
+  // call (GPU-bound when large).
+  std::chrono::nanoseconds TakeGpuWaitTime() {
+    return std::exchange(gpu_wait_time_, std::chrono::nanoseconds(0));
+  }
+  // GPU time measured with timestamps, for the frames finished since the last
+  // call: whole frames, resolves and presentation.
+  struct GpuTimes {
+    uint64_t frames = 0;
+    uint64_t frame_ns = 0;
+    uint64_t resolve_ns = 0;
+    uint64_t present_ns = 0;
+    // Wall time from submission to the fence, for the frames that were waited
+    // for (the others had finished before being checked).
+    uint64_t latency_frames = 0;
+    uint64_t latency_ns = 0;
+  };
+  GpuTimes TakeGpuTimes() { return std::exchange(gpu_times_, GpuTimes()); }
+  // A timestamp in the current frame's command list (UINT32_MAX if the frame
+  // has no room left), and a resolve measured between two of them.
+  uint32_t WriteTimestamp();
+  // plume_gpu_profile: a timestamp, after waiting for all the work before it
+  // (exact on every driver, but slower), starting a segment of GPU time
+  // counted under `label` until the next one.
+  bool profiling() const { return profiling_; }
+  void ProfileMark(std::string_view label);
+  // The labels with the most GPU time since the last call, per frame.
+  std::string TakeProfile();
+  void AddResolveTime(uint32_t begin, uint32_t end);
   uint64_t frame_number() const { return frame_number_; }
 
   struct Allocation {
@@ -117,7 +155,20 @@ class PlumeRenderer {
   };
   struct Frame {
     std::unique_ptr<plume::RenderCommandList> command_list;
+    // Recorded at the end of the frame, executed before command_list.
+    std::unique_ptr<plume::RenderCommandList> upload_list;
+    bool upload_list_open = false;
     std::unique_ptr<plume::RenderCommandFence> fence;
+    // GPU timestamps: 0 at the start of the frame, then pairs around resolves,
+    // then the start and the end of the presentation.
+    std::unique_ptr<plume::RenderQueryPool> queries;
+    uint32_t query_count = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> resolve_queries;
+    uint32_t present_query = UINT32_MAX;
+    // With plume_gpu_profile: timestamps starting labelled segments.
+    std::vector<std::pair<uint32_t, uint32_t>> profile_marks;
+    bool queries_pending = false;
+    std::chrono::steady_clock::time_point submit_time;
     bool submitted = false;
     std::vector<UploadChunk> upload_chunks;
     size_t upload_chunk = 0;
@@ -141,11 +192,25 @@ class PlumeRenderer {
   std::unique_ptr<plume::RenderCommandQueue> queue_;
   Frame frames_[kFramesInFlight];
   uint32_t frame_slot_ = 0;
+  std::chrono::nanoseconds gpu_wait_time_{0};
+  bool timer_period_set_ = false;
+  GpuTimes gpu_times_;
+  bool profiling_ = false;
+  std::unique_ptr<plume::RenderBuffer> profile_buffer_;
+  std::unordered_map<std::string, uint32_t> profile_label_ids_;
+  std::vector<std::string> profile_labels_;
+  std::vector<uint64_t> profile_ns_;
+  std::vector<uint64_t> profile_counts_;
+  uint64_t profile_frames_ = 0;
+  void ProfileBarrier(plume::RenderCommandList* list);
+  void CollectGpuTimes(Frame& frame);
   uint64_t frame_number_ = 0;
   bool frame_open_ = false;
 
   std::unique_ptr<plume::RenderSwapChain> swap_chain_;
-  std::unique_ptr<plume::RenderCommandSemaphore> acquire_semaphore_;
+  // One per frame in flight: a semaphore must not be signalled again by an
+  // acquire before the submission waiting for its previous signal has run.
+  std::unique_ptr<plume::RenderCommandSemaphore> acquire_semaphores_[kFramesInFlight];
   std::vector<std::unique_ptr<plume::RenderCommandSemaphore>> release_semaphores_;
   std::vector<std::unique_ptr<plume::RenderFramebuffer>> framebuffers_;
 

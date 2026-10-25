@@ -68,9 +68,14 @@ class TextureCache {
             uint32_t& swizzle_out);
 
   uint32_t textures_loaded_this_frame() const { return loads_; }
+  size_t texture_count() const { return textures_.size(); }
+  // Indices handed out so far, minus those free for reuse.
+  uint32_t indices_in_use() const { return next_texture_index_ - 1 - uint32_t(free_indices_.size()); }
   // Placeholder bindings since the last call, by reason, for the statistics.
   std::string TakePlaceholderStats();
-  void EndFrame() { loads_ = 0; }
+  // Also releases the textures not used for a while, so their indices can be
+  // reused (there are kMaxTextures).
+  void EndFrame();
 
  private:
   struct Texture {
@@ -88,6 +93,7 @@ class TextureCache {
     std::unique_ptr<plume::RenderTextureView> view;
     // Version of the resolve copied into it, if it comes from one.
     uint64_t resolve_version = 0;
+    uint64_t last_used_frame = 0;
   };
 
   static DescriptorSet SetFor(rex::graphics::xenos::DataDimension dimension) {
@@ -113,12 +119,16 @@ class TextureCache {
 
   std::unordered_map<uint64_t, std::unique_ptr<Texture>> textures_;
   uint32_t next_texture_index_ = 1;
+  // Indices of released textures and the frame they were released in: reused
+  // once no frame in flight can still use them.
+  std::vector<std::pair<uint32_t, uint64_t>> free_indices_;
+  bool out_of_indices_logged_ = false;
   std::unordered_map<uint32_t, uint32_t> sampler_indices_;
   std::vector<std::unique_ptr<plume::RenderSampler>> samplers_;
   uint32_t loads_ = 0;
   uint64_t unsupported_formats_logged_ = 0;
-  // Invalid fetch constant, 3D, cube, load failed.
-  uint64_t placeholders_[4] = {};
+  // Invalid fetch constant, 3D, cube, load failed, no index left.
+  uint64_t placeholders_[5] = {};
   uint64_t placeholder_formats_[64] = {};
 };
 

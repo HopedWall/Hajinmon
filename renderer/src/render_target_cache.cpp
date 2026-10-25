@@ -289,6 +289,7 @@ bool RenderTargetCache::Update(const rex::graphics::RegisterFile& regs, uint32_t
   auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
   uint32_t pitch = surface_info.surface_pitch;
   if (!pitch) {
+    ++skip_reasons[kSkipNoPitch];
     return false;
   }
   plume::RenderCommandList* list = renderer_.command_list();
@@ -301,6 +302,7 @@ bool RenderTargetCache::Update(const rex::graphics::RegisterFile& regs, uint32_t
     TrackedTexture* target = GetRenderTarget(color_info.color_base, uint32_t(color_info.color_format),
                                              false, pitch, surface_info.msaa_samples, height);
     if (!target) {
+      ++skip_reasons[kSkipColorTarget];
       return false;
     }
     target->Transition(list, plume::RenderTextureLayout::COLOR_WRITE);
@@ -311,11 +313,13 @@ bool RenderTargetCache::Update(const rex::graphics::RegisterFile& regs, uint32_t
     binding_out.depth = GetRenderTarget(depth_info.depth_base, uint32_t(depth_info.depth_format),
                                         true, pitch, surface_info.msaa_samples, height);
     if (!binding_out.depth) {
+      ++skip_reasons[kSkipDepthTarget];
       return false;
     }
     binding_out.depth->Transition(list, plume::RenderTextureLayout::DEPTH_WRITE);
   }
   if (!binding_out.color_count && !binding_out.depth) {
+    ++skip_reasons[kSkipNoTargets];
     return false;
   }
   binding_out.framebuffer =

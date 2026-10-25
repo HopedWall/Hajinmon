@@ -3,6 +3,7 @@
 #include "plume_command_processor.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstdlib>
 #include <cstring>
 #include <thread>
@@ -29,6 +30,8 @@ REXCVAR_DEFINE_BOOL(plume_precompile_shaders, false, "GPU/Plume",
                     "Compile the shaders of the executable and those recorded in previous sessions "
                     "to the shader cache with all the cores, then exit (used by the launcher)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(plume_full_float_constants, false, "GPU/Plume",
+                    "Debugging: upload all 256 float constants of each shader instead of those it reads");
 REXCVAR_DEFINE_BOOL(plume_async_shaders, false, "GPU/Plume",
                     "Skip draws whose shaders are still compiling instead of waiting for them");
 
@@ -164,6 +167,7 @@ void PlumeCommandProcessor::InitializeShaderStorage(const std::filesystem::path&
   }
   if (!REXCVAR_GET(plume_precompile_shaders)) {
     shader_cache_->StartPrewarm(std::move(prewarm));
+    pipeline_cache_->StartPrewarm(directory, *shader_cache_);
     return;
   }
   // Precompilation only: before the game starts, so it can use every core.
@@ -231,9 +235,13 @@ bool PlumeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t i
     return IssueCopy();
   }
   ++draws_;
+  // Opens the frame first, so waiting for the GPU is not counted as draw time.
+  plume_graphics_system_->renderer().command_list();
+  auto start = std::chrono::steady_clock::now();
   if (Draw()) {
     ++draws_done_;
   }
+  draw_time_ += std::chrono::steady_clock::now() - start;
   // Draws that can't be done yet are skipped, not treated as errors.
   return true;
 }
@@ -280,6 +288,11 @@ bool PlumeCommandProcessor::Draw() {
       primitive.host_vertex_shader_type != Shader::HostVertexShaderType::kVertex) {
     return Skip(kSkipPrimitive);
   }
+  if (primitive.index_buffer_type == PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA) {
+    shared_memory_->MarkRead(primitive.guest_index_base,
+                             primitive.host_draw_vertex_count *
+                                 (primitive.host_index_format == xenos::IndexFormat::kInt32 ? 4 : 2));
+  }
 
   // Render targets.
   reg::RB_DEPTHCONTROL depth_control = draw_util::GetNormalizedDepthControl(regs);
@@ -295,13 +308,24 @@ bool PlumeCommandProcessor::Draw() {
   }
   color_mask &= (1u << (targets.color_count * 4)) - 1;
 
-  // Vertex buffers.
+  // Vertex buffers, requested at once (several bindings often share one).
+  std::pair<uint32_t, uint32_t> vertex_ranges[32];
+  size_t vertex_range_count = 0;
   for (const Shader::VertexBinding& binding : vertex_shader->vertex_bindings()) {
     xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(binding.fetch_constant);
     if (fetch.type != xenos::FetchConstantType::kVertex || !fetch.size) {
       continue;
     }
-    shared_memory_->RequestRange(fetch.address << 2, fetch.size << 2);
+    std::pair<uint32_t, uint32_t> range(fetch.address << 2, fetch.size << 2);
+    if (std::find(vertex_ranges, vertex_ranges + vertex_range_count, range) ==
+            vertex_ranges + vertex_range_count &&
+        vertex_range_count < std::size(vertex_ranges)) {
+      vertex_ranges[vertex_range_count++] = range;
+    }
+  }
+  shared_memory_->RequestRanges(vertex_ranges, vertex_range_count);
+  for (size_t i = 0; i < vertex_range_count; ++i) {
+    shared_memory_->MarkRead(vertex_ranges[i].first, vertex_ranges[i].second);
   }
 
   // System constants and textures.
@@ -344,24 +368,37 @@ bool PlumeCommandProcessor::Draw() {
   }
 
   // Constant blocks.
-  auto float_block = [&](uint32_t base, std::vector<uint8_t>& data) {
-    data.assign(256 * 16, 0);
+  // Float constants: from the shader's base up to the last register it reads
+  // (all 256 with relative addressing), straight from the registers.
+  auto write_floats = [&](Block block, const Shader& shader, uint32_t base) -> uint32_t {
+    const Shader::ConstantRegisterMap& map = shader.constant_register_map();
+    uint32_t count = 0;
+    if (map.float_dynamic_addressing || REXCVAR_GET(plume_full_float_constants)) {
+      count = 256;
+    } else {
+      for (uint32_t i = 4; i-- > 0;) {
+        if (map.float_bitmap[i]) {
+          count = i * 64 + 64 - uint32_t(std::countl_zero(map.float_bitmap[i]));
+          break;
+        }
+      }
+    }
     base = std::min(base, 511u);
-    uint32_t count = std::min(256u, 512u - base);
-    std::memcpy(data.data(), &regs.values[rex::graphics::XE_GPU_REG_SHADER_CONSTANT_000_X + base * 4], count * 16);
+    count = std::min(count, 512u - base);
+    if (!count) {
+      return 0;
+    }
+    return WriteBlock(block, &regs.values[rex::graphics::XE_GPU_REG_SHADER_CONSTANT_000_X + base * 4],
+                      count * 16);
   };
-  std::vector<uint8_t> vertex_floats, pixel_floats;
-  float_block(regs.Get<reg::SQ_VS_CONST>().base, vertex_floats);
-  float_block(regs.Get<reg::SQ_PS_CONST>().base, pixel_floats);
   uint32_t bool_loop[40];
   std::memcpy(bool_loop, &regs.values[rex::graphics::XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], 8 * 4);
   std::memcpy(bool_loop + 8, &regs.values[rex::graphics::XE_GPU_REG_SHADER_CONSTANT_LOOP_00], 32 * 4);
   uint32_t push[8] = {
       WriteBlock(kBlockSystem, &system, sizeof(system)),
-      WriteBlock(kBlockVertexFloat, vertex_floats.data(), uint32_t(vertex_floats.size())),
-      pixel_compiled
-          ? WriteBlock(kBlockPixelFloat, pixel_floats.data(), uint32_t(pixel_floats.size()))
-          : 0,
+      write_floats(kBlockVertexFloat, *vertex_shader, regs.Get<reg::SQ_VS_CONST>().base),
+      pixel_compiled ? write_floats(kBlockPixelFloat, *pixel_shader, regs.Get<reg::SQ_PS_CONST>().base)
+                     : 0,
       WriteBlock(kBlockBoolLoop, bool_loop, sizeof(bool_loop)),
       WriteBlock(kBlockFetch, &regs.values[rex::graphics::XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], 192 * 4),
   };
@@ -414,60 +451,129 @@ bool PlumeCommandProcessor::Draw() {
     return Skip(kSkipPipeline);
   }
 
-  // Draw.
+  // Draw, setting only the state that changed.
+  shared_memory_->FinishUploads();
   plume::RenderCommandList* list = renderer.command_list();
-  list->setFramebuffer(targets.framebuffer);
-  list->setGraphicsPipelineLayout(pipeline_cache_->layout());
-  list->setPipeline(pipeline);
-  list->setGraphicsDescriptorSet(frame_sets_[renderer.frame_slot()].get(), 0);
-  for (uint32_t i = 0; i < TextureCache::kSetCount; ++i) {
-    list->setGraphicsDescriptorSet(texture_cache_->descriptor_set(TextureCache::DescriptorSet(i)),
-                                   1 + i);
+  if (bound_.frame != renderer.frame_number()) {
+    bound_ = BoundState();
+    bound_.frame = renderer.frame_number();
   }
-  list->setGraphicsPushConstants(0, push);
-  list->setViewports(plume::RenderViewport(float(viewport.xy_offset[0]), float(viewport.xy_offset[1]),
-                                           float(viewport.xy_extent[0]), float(viewport.xy_extent[1]),
-                                           viewport.z_min, viewport.z_max));
+  if (bound_.framebuffer != targets.framebuffer) {
+    if (renderer.profiling()) {
+      // A segment per render target set (a render pass on Vulkan).
+      std::string label = "draws";
+      for (uint32_t i = 0; i < targets.color_count; ++i) {
+        label += fmt::format(" rt{} fmt{}", i, uint32_t(targets.color[i]->format));
+      }
+      if (targets.depth) {
+        label += " depth";
+      }
+      label += fmt::format(" {}x{} {}x", targets.width, targets.height, targets.samples);
+      renderer.ProfileMark(label);
+    }
+    list->setFramebuffer(targets.framebuffer);
+    bound_.framebuffer = targets.framebuffer;
+  }
+  if (!bound_.layout) {
+    // Binding the layout unbinds the descriptor sets (Direct3D 12 root signature).
+    list->setGraphicsPipelineLayout(pipeline_cache_->layout());
+    list->setGraphicsDescriptorSet(frame_sets_[renderer.frame_slot()].get(), 0);
+    for (uint32_t i = 0; i < TextureCache::kSetCount; ++i) {
+      list->setGraphicsDescriptorSet(texture_cache_->descriptor_set(TextureCache::DescriptorSet(i)),
+                                     1 + i);
+    }
+    bound_.layout = true;
+    bound_.push_valid = false;
+  }
+  if (bound_.pipeline != pipeline) {
+    list->setPipeline(pipeline);
+    bound_.pipeline = pipeline;
+  }
+  if (!bound_.push_valid || std::memcmp(bound_.push, push, sizeof(push))) {
+    list->setGraphicsPushConstants(0, push);
+    std::memcpy(bound_.push, push, sizeof(push));
+    bound_.push_valid = true;
+  }
+  plume::RenderViewport host_viewport(float(viewport.xy_offset[0]), float(viewport.xy_offset[1]),
+                                      float(viewport.xy_extent[0]), float(viewport.xy_extent[1]),
+                                      viewport.z_min, viewport.z_max);
+  if (!bound_.viewport_valid || std::memcmp(&bound_.viewport, &host_viewport, sizeof(host_viewport))) {
+    list->setViewports(host_viewport);
+    bound_.viewport = host_viewport;
+    bound_.viewport_valid = true;
+  }
   int32_t scissor_right =
       int32_t(std::min((scissor.offset[0] + scissor.extent[0]) * scale, targets.width));
   int32_t scissor_bottom =
       int32_t(std::min((scissor.offset[1] + scissor.extent[1]) * scale, targets.height));
-  list->setScissors(plume::RenderRect(int32_t(scissor.offset[0] * scale),
-                                      int32_t(scissor.offset[1] * scale), scissor_right,
-                                      scissor_bottom));
+  plume::RenderRect host_scissor(int32_t(scissor.offset[0] * scale), int32_t(scissor.offset[1] * scale),
+                                 scissor_right, scissor_bottom);
+  if (!bound_.scissor_valid || std::memcmp(&bound_.scissor, &host_scissor, sizeof(host_scissor))) {
+    list->setScissors(host_scissor);
+    bound_.scissor = host_scissor;
+    bound_.scissor_valid = true;
+  }
   uint32_t count = primitive.host_draw_vertex_count;
   if (primitive.index_buffer_type == PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
     list->drawInstanced(count, 1, 0, 0);
     return true;
   }
   bool is_32bit = primitive.host_index_format == xenos::IndexFormat::kInt32;
-  plume::RenderBufferReference index_buffer =
-      primitive.index_buffer_type == PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA
-          ? plume::RenderBufferReference(shared_memory_->buffer(), primitive.guest_index_base)
-          : primitive_processor_->GetIndexBuffer(primitive);
-  if (!index_buffer.ref) {
-    return Skip(kSkipIndexBuffer);
+  uint32_t index_size = is_32bit ? 4 : 2;
+  plume::RenderFormat index_format = is_32bit ? plume::RenderFormat::R32_UINT : plume::RenderFormat::R16_UINT;
+  plume::RenderIndexBufferView view;
+  uint32_t first_index = 0;
+  if (primitive.index_buffer_type == PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA &&
+      !(primitive.guest_index_base & (index_size - 1))) {
+    // Indices from guest memory: the whole shared memory as one view, which
+    // stays bound across draws, with the guest address as the first index.
+    view = plume::RenderIndexBufferView(plume::RenderBufferReference(shared_memory_->buffer(), 0),
+                                        PlumeSharedMemory::kBufferSize, index_format);
+    first_index = primitive.guest_index_base / index_size;
+  } else {
+    plume::RenderBufferReference index_buffer =
+        primitive.index_buffer_type == PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA
+            ? plume::RenderBufferReference(shared_memory_->buffer(), primitive.guest_index_base)
+            : primitive_processor_->GetIndexBuffer(primitive);
+    if (!index_buffer.ref) {
+      return Skip(kSkipIndexBuffer);
+    }
+    view = plume::RenderIndexBufferView(index_buffer, count * index_size, index_format);
   }
-  plume::RenderIndexBufferView view(index_buffer, count * (is_32bit ? 4 : 2),
-                                    is_32bit ? plume::RenderFormat::R32_UINT
-                                             : plume::RenderFormat::R16_UINT);
-  list->setIndexBuffer(&view);
-  list->drawIndexedInstanced(count, 1, 0, 0, 0);
+  if (!bound_.index_valid || bound_.index.buffer.ref != view.buffer.ref ||
+      bound_.index.buffer.offset != view.buffer.offset || bound_.index.size != view.size ||
+      bound_.index.format != view.format) {
+    list->setIndexBuffer(&view);
+    bound_.index = view;
+    bound_.index_valid = true;
+  }
+  list->drawIndexedInstanced(count, 1, first_index, 0, 0);
   return true;
 }
 
 bool PlumeCommandProcessor::IssueCopy() {
   ++copies_;
+  plume_graphics_system_->renderer().command_list();
+  auto start = std::chrono::steady_clock::now();
+  plume_graphics_system_->renderer().ProfileMark("resolves and clears");
+  uint32_t gpu_begin = plume_graphics_system_->renderer().WriteTimestamp();
   draw_util::ResolveInfo info;
   if (draw_util::GetResolveInfo(*register_file_, *memory_, 1, 1, false, false, info)) {
     render_target_cache_->Resolve(*register_file_, info);
   }
+  plume_graphics_system_->renderer().AddResolveTime(gpu_begin,
+                                                    plume_graphics_system_->renderer().WriteTimestamp());
+  copy_time_ += std::chrono::steady_clock::now() - start;
+  // Resolves set their own framebuffer, pipeline and layout.
+  bound_ = BoundState();
   return true;
 }
 
 void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   ++frames_;
+  auto start = std::chrono::steady_clock::now();
+  shared_memory_->EndFrame();
   RenderTargetCache::Resolved* frontbuffer = render_target_cache_->FindResolved(frontbuffer_ptr);
   if (plume_graphics_system_->renderer().EndFrame(frontbuffer ? &frontbuffer->texture : nullptr,
                                                   frontbuffer_width * render_target_cache_->scale(),
@@ -477,6 +583,8 @@ void PlumeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                                                   false)) {
     ++presented_;
   }
+  swap_time_ += std::chrono::steady_clock::now() - start;
+  bound_ = BoundState();
   primitive_processor_->EndFrame();
   texture_cache_->EndFrame();
   for (BlockState& block : blocks_) {
@@ -500,6 +608,31 @@ void PlumeCommandProcessor::LogStats() {
       shaders_.size(), shader_cache_->stats().compiled.load(), shader_cache_->stats().loaded.load(),
       shader_cache_->stats().failed.load(), shader_cache_->pending_builds(),
       pipeline_cache_->pipeline_count());
+  REXLOG_INFO("Plume: {} textures, {} of {} texture indices in use", texture_cache_->texture_count(),
+              texture_cache_->indices_in_use(), TextureCache::kMaxTextures);
+  auto per_frame_ms = [&](std::chrono::nanoseconds time) {
+    return std::chrono::duration<double, std::milli>(time).count() / frames;
+  };
+  REXLOG_INFO(
+      "Plume: per frame {:.2f} ms draws, {:.2f} ms resolves, {:.2f} ms submit and present, {:.2f} "
+      "ms waiting for the GPU",
+      per_frame_ms(draw_time_), per_frame_ms(copy_time_), per_frame_ms(swap_time_),
+      per_frame_ms(plume_graphics_system_->renderer().TakeGpuWaitTime()));
+  draw_time_ = copy_time_ = swap_time_ = std::chrono::nanoseconds(0);
+  PlumeRenderer::GpuTimes gpu = plume_graphics_system_->renderer().TakeGpuTimes();
+  if (gpu.frames) {
+    double gpu_frames = double(gpu.frames);
+    REXLOG_INFO("Plume: GPU per frame {:.2f} ms, of which {:.2f} ms resolves and {:.2f} ms presentation; "
+                "submission to completion {:.2f} ms ({} frames waited for)",
+                double(gpu.frame_ns) / 1e6 / gpu_frames, double(gpu.resolve_ns) / 1e6 / gpu_frames,
+                double(gpu.present_ns) / 1e6 / gpu_frames,
+                gpu.latency_frames ? double(gpu.latency_ns) / 1e6 / double(gpu.latency_frames) : 0.0,
+                gpu.latency_frames);
+  }
+  std::string profile = plume_graphics_system_->renderer().TakeProfile();
+  if (!profile.empty()) {
+    REXLOG_INFO("Plume: GPU profile per frame (time, segments, what):{}", profile);
+  }
   static const char* const kSkipNames[kSkipCount] = {
       "no vertex shader", "no rasterization", "shader not ready", "primitive", "render targets",
       "constants full", "culled", "pipeline", "index buffer"};
@@ -512,6 +645,12 @@ void PlumeCommandProcessor::LogStats() {
   }
   if (!skipped.empty()) {
     skipped.pop_back();
+    uint64_t* reasons = render_target_cache_->skip_reasons;
+    if (reasons[0] + reasons[1] + reasons[2] + reasons[3]) {
+      skipped += fmt::format(" (render targets: {} no pitch, {} color target, {} depth target, {} nothing to write)",
+                             reasons[0], reasons[1], reasons[2], reasons[3]);
+    }
+    std::fill(reasons, reasons + RenderTargetCache::kSkipReasonCount, 0);
     REXLOG_INFO("Plume: skipped draws:{}", skipped);
   }
   std::string placeholders = texture_cache_->TakePlaceholderStats();

@@ -67,7 +67,7 @@ target_link_libraries(hajinmon_plume
 )
 if(WIN32)
     # Plume's Direct3D 12 backend (without the Agility SDK) uses the system libraries.
-    target_link_libraries(hajinmon_plume PUBLIC d3d12 dxgi dxguid)
+    target_link_libraries(hajinmon_plume PUBLIC d3d12 dxgi dxguid winmm)
 else()
     # Plume's Vulkan backend presents to X11 windows (Xlib), dlopen loads DXC.
     find_package(X11 REQUIRED)
@@ -95,7 +95,7 @@ add_dependencies(hajinmon_plume hajinmon_dxc_runtime)
 
 # Offline check: translates and compiles every shader of the executable.
 add_executable(hajinmon_shader_tool EXCLUDE_FROM_ALL tools/shader_tool.cpp)
-target_link_libraries(hajinmon_shader_tool PRIVATE hajinmon_plume)
+target_link_libraries(hajinmon_shader_tool PRIVATE hajinmon_plume rex::xxhash)
 target_include_directories(hajinmon_shader_tool PRIVATE "${HAJINMON_DXC_DIR}/inc")
 set_target_properties(hajinmon_shader_tool PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 

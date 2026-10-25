@@ -132,7 +132,9 @@ void ShaderCache::BuildWorker() {
     Build(shader, *compiled);
     {
       std::lock_guard<std::mutex> lock(build_mutex_);
-      built_[request.hash] = std::move(compiled);
+      // The first result stays (the prewarm may have built it already): its
+      // address may be in use.
+      built_.try_emplace(request.hash, std::move(compiled));
     }
     built_condition_.notify_all();
     --pending_builds_;
@@ -285,8 +287,15 @@ void ShaderCache::PrewarmWorker() {
       ++prewarm_skipped_;
       continue;
     }
-    CompiledShader compiled;
-    Build(shader, compiled);
+    auto compiled = std::make_unique<CompiledShader>();
+    if (Build(shader, *compiled)) {
+      // Kept for the pipeline prewarm and for the game's first use.
+      {
+        std::lock_guard<std::mutex> lock(build_mutex_);
+        built_.try_emplace(shader.ucode_data_hash(), std::move(compiled));
+      }
+      built_condition_.notify_all();
+    }
   }
   if (--prewarm_remaining_workers_ == 0 && !prewarm_stop_) {
     double seconds =

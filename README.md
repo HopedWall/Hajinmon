@@ -316,6 +316,11 @@ only.
 `F3` saves a screenshot to `Pictures\Hajinmon`. For debugging,
 `--plume_capture_path=FOLDER` saves a frame every `--plume_capture_interval`
 frames and `--plume_dump_shaders=FOLDER` writes the HLSL of every shader.
+Every 5 seconds the log reports the CPU time per frame (draws, resolves,
+presentation, waiting for the GPU) and the GPU time; `--plume_gpu_profile`
+breaks the GPU time down by render target (exact, but it serializes the GPU).
+Pipelines are recorded next to the shader cache and created again in the
+background at startup, so new scenes don't stall after the first time.
 
 ## Troubleshooting
 

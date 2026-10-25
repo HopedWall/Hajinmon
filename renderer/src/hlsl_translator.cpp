@@ -1262,15 +1262,22 @@ std::vector<uint8_t> HlslShaderTranslator::CompleteTranslation() {
                         has_outputs ? "XePixelOutput" : "void");
     uint32_t interpolators = std::min(register_count, kInterpolatorCount);
     hlsl += "  xe_load_system_constants(true);\n";
-    hlsl += fmt::format("  for (uint xe_i = 0u; xe_i < {}u; ++xe_i) {{\n", interpolators);
+    // Only constant indices into r (once the loops are unrolled): a single
+    // dynamic index makes the compiler keep the whole array in memory instead
+    // of registers, which makes every register access slow (very on AMD).
+    hlsl += fmt::format("  [unroll] for (uint xe_i = 0u; xe_i < {}u; ++xe_i) {{\n", interpolators);
     hlsl += "    r[xe_i] = xe_input.interpolators[xe_i];\n";
     hlsl += "  }\n";
     hlsl += "  if (xe_ps_param_gen != 0u) {\n";
     // In guest pixels, also with resolution scaling.
     hlsl += "    float2 xe_pixel = floor(xe_input.position.xy / xe_resolution_scale);\n";
     hlsl += "    float xe_x = xe_front_facing ? xe_pixel.x : asfloat(asuint(xe_pixel.x) | 0x80000000u);\n";
-    hlsl += fmt::format("    r[min(xe_ps_param_gen - 1u, {}u)] = float4(xe_x, xe_pixel.y, 0.0f, 0.0f);\n",
-                        register_count - 1);
+    hlsl += fmt::format("    uint xe_param_gen_register = min(xe_ps_param_gen - 1u, {}u);\n", register_count - 1);
+    hlsl += fmt::format("    [unroll] for (uint xe_i = 0u; xe_i < {}u; ++xe_i) {{\n", register_count);
+    hlsl += "      if (xe_i == xe_param_gen_register) {\n";
+    hlsl += "        r[xe_i] = float4(xe_x, xe_pixel.y, 0.0f, 0.0f);\n";
+    hlsl += "      }\n";
+    hlsl += "    }\n";
     hlsl += "  }\n";
     hlsl += "  xe_execute();\n";
     if (!has_outputs) {
