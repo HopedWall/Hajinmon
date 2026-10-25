@@ -320,7 +320,7 @@ public sealed class MainForm : Form
             "larger than the internal resolution."));
         AddRow(grid, null, Note(
             "The Plume renderer draws the game natively instead of emulating the Xbox 360 GPU. " +
-            "It is experimental: it has its own MSAA (smoother edges) but no FXAA, CAS or FSR, " +
+            "It is experimental: it has its own MSAA (smoother edges) and CAS/FSR, but no FXAA, " +
             "and always uses the default graphics card. It compiles the game's shaders the first " +
             "time they appear; \"Precompile shaders\" compiles the known ones in advance (all of " +
             "them after a first play), for slower devices or after an update."));
@@ -338,7 +338,6 @@ public sealed class MainForm : Form
     {
         bool plume = PlumeSelected;
         _antiAliasing.Enabled = !plume;
-        _scaling.Enabled = !plume;
         _gpu.Enabled = !plume;
         _msaa.Enabled = plume;
         _precompileShaders.Enabled = plume;
@@ -697,6 +696,7 @@ public sealed class MainForm : Form
             args.Add(Flag("plume_vsync", s.VSync));
             args.Add($"--plume_anisotropic={s.Anisotropic}");
             args.Add(Flag("plume_letterbox", s.KeepAspectRatio));
+            args.Add($"--plume_present_effect={s.ScalingFilter}");
             AddCommonArguments(args, s);
             return string.Join(' ', args);
         }

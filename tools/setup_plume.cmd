@@ -3,6 +3,8 @@ rem Clones the dependencies of the experimental native renderer at pinned commit
 rem - Plume (https://github.com/renderbag/plume), the graphics library, into external\plume.
 rem - DXC binaries (https://github.com/renderbag/dxc-bin), the shader compiler, into
 rem   external\dxc-bin.
+rem - AMD FidelityFX FSR 1 (https://github.com/GPUOpen-Effects/FidelityFX-FSR), the
+rem   upscaler of the presentation, into external\FidelityFX-FSR.
 rem Usage: tools\setup_plume.cmd
 
 setlocal
@@ -11,6 +13,8 @@ set "PLUME=%ROOT%\external\plume"
 set "COMMIT=0ce184b19270e49236afbb74052a6b267494b86b"
 set "DXC=%ROOT%\external\dxc-bin"
 set "DXC_COMMIT=737ac9f51c3d06f0cd1ee7e14dc065bafd52310d"
+set "FSR=%ROOT%\external\FidelityFX-FSR"
+set "FSR_COMMIT=a21ffb8f6c13233ba336352bdff293894c706575"
 
 if not exist "%PLUME%\CMakeLists.txt" (
     echo Cloning Plume...
@@ -28,3 +32,11 @@ if not exist "%DXC%\inc\dxcapi.h" (
 git -C "%DXC%" fetch --quiet origin || exit /b 1
 git -C "%DXC%" checkout --quiet %DXC_COMMIT% || exit /b 1
 echo DXC ready at %DXC_COMMIT%.
+
+if not exist "%FSR%fx-fsrfx_fsr1.h" (
+    echo Cloning FidelityFX FSR...
+    git clone https://github.com/GPUOpen-Effects/FidelityFX-FSR "%FSR%" || exit /b 1
+)
+git -C "%FSR%" fetch --quiet origin || exit /b 1
+git -C "%FSR%" checkout --quiet %FSR_COMMIT% || exit /b 1
+echo FidelityFX FSR ready at %FSR_COMMIT%.

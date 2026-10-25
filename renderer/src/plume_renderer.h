@@ -183,6 +183,11 @@ class PlumeRenderer {
   bool EnsureSwapChain();
   void DestroySwapChain();
   bool CreatePresentPipeline();
+  // plume_present_effect cas and fsr: EASU (AMD FidelityFX FSR 1, upscaling)
+  // or bilinear filtering to an image at the output size, then RCAS
+  // (sharpening) to the swap chain.
+  bool CreateFsrPipelines();
+  bool EnsureFsrImage(uint32_t width, uint32_t height);
   void WaitForIdle();
 
   const char* backend_name_ = "none";
@@ -219,6 +224,14 @@ class PlumeRenderer {
   std::unique_ptr<plume::RenderPipeline> present_pipeline_;
   std::unique_ptr<plume::RenderSampler> present_sampler_;
   std::unique_ptr<plume::RenderDescriptorSet> present_sets_[kFramesInFlight];
+  std::unique_ptr<plume::RenderPipelineLayout> fsr_layout_;
+  std::unique_ptr<plume::RenderPipeline> fsr_easu_pipeline_;
+  std::unique_ptr<plume::RenderPipeline> fsr_bilinear_pipeline_;
+  std::unique_ptr<plume::RenderPipeline> fsr_rcas_pipeline_;
+  std::unique_ptr<plume::RenderDescriptorSet> fsr_input_sets_[kFramesInFlight];
+  std::unique_ptr<plume::RenderDescriptorSet> fsr_rcas_sets_[kFramesInFlight];
+  TrackedTexture fsr_image_;
+  std::unique_ptr<plume::RenderFramebuffer> fsr_framebuffer_;
 
   // Debugging frame captures.
   std::unique_ptr<plume::RenderBuffer> capture_buffer_;

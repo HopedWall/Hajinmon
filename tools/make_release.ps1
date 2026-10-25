@@ -37,6 +37,8 @@ foreach ($file in "dxcompiler.dll", "dxil.dll") {
 }
 $plumeLicense = Join-Path $root "external\plume\LICENSE"
 if (Test-Path $plumeLicense) { Copy-Item $plumeLicense (Join-Path $stage "LICENSE-plume.txt") }
+$fsrLicense = Join-Path $root "external\FidelityFX-FSR\license.txt"
+if (Test-Path $fsrLicense) { Copy-Item $fsrLicense (Join-Path $stage "LICENSE-fidelityfx-fsr.txt") }
 if (Test-Path (Join-Path $stage "dxcompiler.dll")) {
     Copy-Item (Join-Path $root "renderer\LICENSE-dxc.txt") (Join-Path $stage "LICENSE-dxc.txt")
 }

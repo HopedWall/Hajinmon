@@ -18,6 +18,24 @@ if(NOT EXISTS "${HAJINMON_DXC_DIR}/inc/dxcapi.h")
 endif()
 add_subdirectory("${HAJINMON_PLUME_DIR}" plume EXCLUDE_FROM_ALL)
 
+# AMD FidelityFX FSR 1 (MIT), the upscaler of the presentation: its HLSL
+# headers are embedded in the renderer and compiled with the other built-in
+# shaders at startup.
+set(HAJINMON_FSR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../external/FidelityFX-FSR"
+    CACHE PATH "FidelityFX FSR source tree (tools/setup_plume.cmd)")
+set(HAJINMON_FSR_HEADERS "${HAJINMON_FSR_DIR}/ffx-fsr/ffx_a.h" "${HAJINMON_FSR_DIR}/ffx-fsr/ffx_fsr1.h")
+if(NOT EXISTS "${HAJINMON_FSR_DIR}/ffx-fsr/ffx_fsr1.h")
+    message(FATAL_ERROR "FidelityFX FSR not found in ${HAJINMON_FSR_DIR}: run tools\\setup_plume.cmd (Windows) or tools/setup_plume.sh (Linux)")
+endif()
+file(READ "${HAJINMON_FSR_DIR}/ffx-fsr/ffx_a.h" HAJINMON_FFX_A)
+file(READ "${HAJINMON_FSR_DIR}/ffx-fsr/ffx_fsr1.h" HAJINMON_FFX_FSR1)
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/fsr_sources.h"
+    "// Generated from FidelityFX FSR (external/FidelityFX-FSR) by renderer/CMakeLists.txt.\n"
+    "#pragma once\n"
+    "static const char kFfxA[] = R\"FFXSRC(${HAJINMON_FFX_A})FFXSRC\";\n"
+    "static const char kFfxFsr1[] = R\"FFXSRC(${HAJINMON_FFX_FSR1})FFXSRC\";\n")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${HAJINMON_FSR_HEADERS})
+
 # The SDK's base GPU code (GPU registers, command stream parsing, vblank,
 # interrupts, shader microcode parsing) is compiled in from the SDK sources, as
 # the rexgpu-xenos plugin does.
@@ -61,6 +79,7 @@ add_library(hajinmon_plume STATIC
     ${HAJINMON_SDK_GPU_SOURCES}
 )
 target_include_directories(hajinmon_plume PUBLIC src)
+target_include_directories(hajinmon_plume PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(hajinmon_plume
     PUBLIC rex::runtime plume
     PRIVATE rex::xxhash rex::renderdoc

@@ -4,7 +4,10 @@
 
 #include "png_writer.h"
 
+#include "fsr_sources.h"
+
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -36,6 +39,13 @@ REXCVAR_DEFINE_INT32(plume_resolution_scale, 2, "GPU/Plume",
                      "Native renderer resolution scale (1 = 1280x720, 2 = 2560x1440...)")
     .range(1, 4)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(plume_present_effect, "bilinear", "GPU/Plume",
+                      "Scaling of the image to the window: bilinear, cas (bilinear and sharpened) or fsr "
+                      "(AMD FidelityFX FSR 1 upscaling and sharpening, best with a low resolution scale)")
+    .allowed({"bilinear", "cas", "fsr"});
+REXCVAR_DEFINE_DOUBLE(plume_fsr_sharpness, 0.2, "GPU/Plume",
+                      "Sharpening of cas and fsr, in stops: 0 is the sharpest, 2 the softest")
+    .range(0.0, 2.0);
 REXCVAR_DEFINE_BOOL(plume_skip_present, false, "GPU/Plume",
                     "Debugging: render every frame but never present it (the window stays black)");
 REXCVAR_DEFINE_BOOL(plume_gpu_profile, false, "GPU/Plume",
@@ -119,6 +129,74 @@ bool ToRenderWindow(void* window, plume::RenderWindow& render_window) {
 }
 #endif
 
+// The FSR passes: drawn over the output with the present vertex shader.
+const char kFsrPrefix[] = R"(
+struct FsrConstants {
+  // The used size of the input, the size of its texture.
+  float4 input;
+  // The output size, its position in the render target.
+  float4 output;
+  // 1 to swap red and blue, sharpness in stops.
+  float4 params;
+};
+[[vk::push_constant]] ConstantBuffer<FsrConstants> fsr_constants : register(b0, space1);
+Texture2D fsr_input : register(t0, space0);
+SamplerState fsr_sampler : register(s1, space0);
+
+struct VertexOutput {
+  float2 uv : TEXCOORD0;
+  float4 position : SV_Position;
+};
+
+#define A_GPU 1
+#define A_HLSL 1
+)";
+
+const char kFsrEasuCallbacks[] = R"(
+#define FSR_EASU_F 1
+AF4 FsrEasuRF(AF2 p) { return fsr_input.GatherRed(fsr_sampler, p); }
+AF4 FsrEasuGF(AF2 p) { return fsr_input.GatherGreen(fsr_sampler, p); }
+AF4 FsrEasuBF(AF2 p) { return fsr_input.GatherBlue(fsr_sampler, p); }
+)";
+
+const char kFsrEasuMain[] = R"(
+float4 main(VertexOutput input) : SV_Target0 {
+  AU4 con0, con1, con2, con3;
+  FsrEasuCon(con0, con1, con2, con3, fsr_constants.input.x, fsr_constants.input.y,
+             fsr_constants.input.z, fsr_constants.input.w, fsr_constants.output.x,
+             fsr_constants.output.y);
+  AF3 color;
+  FsrEasuF(color, AU2(input.position.xy), con0, con1, con2, con3);
+  return float4(color, 1.0f);
+}
+)";
+
+const char kFsrBilinearMain[] = R"(
+float4 main(VertexOutput input) : SV_Target0 {
+  float2 uv = input.uv * fsr_constants.input.xy / fsr_constants.input.zw;
+  return float4(fsr_input.SampleLevel(fsr_sampler, uv, 0.0f).rgb, 1.0f);
+}
+)";
+
+const char kFsrRcasCallbacks[] = R"(
+#define FSR_RCAS_F 1
+AF4 FsrRcasLoadF(ASU2 p) { return fsr_input.Load(int3(p, 0)); }
+void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
+)";
+
+const char kFsrRcasMain[] = R"(
+float4 main(VertexOutput input) : SV_Target0 {
+  AU4 con;
+  FsrRcasCon(con, fsr_constants.params.y);
+  AF1 r, g, b;
+  FsrRcasF(r, g, b, AU2(input.position.xy - fsr_constants.output.zw), con);
+  float3 color = float3(r, g, b);
+  return float4(fsr_constants.params.x != 0.0f ? color.bgr : color, 1.0f);
+}
+)";
+
+constexpr plume::RenderFormat kFsrImageFormat = plume::RenderFormat::R8G8B8A8_UNORM;
+
 }  // namespace
 
 PlumeRenderer::PlumeRenderer() = default;
@@ -170,6 +248,10 @@ bool PlumeRenderer::Initialize() {
   if (!CreatePresentPipeline()) {
     REXLOG_ERROR("Plume: could not create the present pipeline");
     return false;
+  }
+  if (!CreateFsrPipelines()) {
+    REXLOG_WARN("Plume: FidelityFX FSR is not available, presenting with bilinear filtering");
+    fsr_rcas_pipeline_.reset();
   }
   profiling_ = REXCVAR_GET(plume_gpu_profile);
   if (profiling_) {
@@ -277,6 +359,76 @@ bool PlumeRenderer::CreatePresentPipeline() {
   desc.primitiveTopology = plume::RenderPrimitiveTopology::TRIANGLE_LIST;
   present_pipeline_ = device_->createGraphicsPipeline(desc);
   return present_pipeline_ != nullptr;
+}
+
+bool PlumeRenderer::CreateFsrPipelines() {
+  plume::RenderDescriptorRange ranges[] = {
+      plume::RenderDescriptorRange(plume::RenderDescriptorRangeType::TEXTURE, 0, 1),
+      plume::RenderDescriptorRange(plume::RenderDescriptorRangeType::SAMPLER, 1, 1),
+  };
+  plume::RenderDescriptorSetDesc set_desc(ranges, 2);
+  plume::RenderPushConstantRange push_constants(0, 1, 0, 48, plume::RenderShaderStageFlag::PIXEL);
+  plume::RenderPipelineLayoutDesc layout_desc(&push_constants, 1, &set_desc, 1);
+  fsr_layout_ = device_->createPipelineLayout(layout_desc);
+  for (uint32_t i = 0; i < kFramesInFlight; ++i) {
+    fsr_input_sets_[i] = device_->createDescriptorSet(set_desc);
+    fsr_input_sets_[i]->setSampler(1, present_sampler_.get());
+    fsr_rcas_sets_[i] = device_->createDescriptorSet(set_desc);
+    fsr_rcas_sets_[i]->setSampler(1, present_sampler_.get());
+  }
+  auto vertex_shader = CompileBuiltinShader(kPresentShaders, ShaderCompiler::Stage::kVertex);
+  std::string prefix = std::string(kFsrPrefix) + kFfxA;
+  auto easu = CompileBuiltinShader((prefix + kFsrEasuCallbacks + kFfxFsr1 + kFsrEasuMain).c_str(),
+                                   ShaderCompiler::Stage::kPixel);
+  auto bilinear = CompileBuiltinShader((std::string(kFsrPrefix) + kFsrBilinearMain).c_str(),
+                                       ShaderCompiler::Stage::kPixel);
+  auto rcas = CompileBuiltinShader((prefix + kFsrRcasCallbacks + kFfxFsr1 + kFsrRcasMain).c_str(),
+                                   ShaderCompiler::Stage::kPixel);
+  if (!fsr_layout_ || !vertex_shader || !easu || !bilinear || !rcas) {
+    return false;
+  }
+  auto create = [&](plume::RenderShader* pixel_shader, plume::RenderFormat format) {
+    plume::RenderGraphicsPipelineDesc desc;
+    desc.pipelineLayout = fsr_layout_.get();
+    desc.vertexShader = vertex_shader.get();
+    desc.pixelShader = pixel_shader;
+    desc.renderTargetFormat[0] = format;
+    desc.renderTargetBlend[0] = plume::RenderBlendDesc::Copy();
+    desc.renderTargetCount = 1;
+    desc.primitiveTopology = plume::RenderPrimitiveTopology::TRIANGLE_LIST;
+    return device_->createGraphicsPipeline(desc);
+  };
+  fsr_easu_pipeline_ = create(easu.get(), kFsrImageFormat);
+  fsr_bilinear_pipeline_ = create(bilinear.get(), kFsrImageFormat);
+  fsr_rcas_pipeline_ = create(rcas.get(), kSwapChainFormat);
+  return fsr_easu_pipeline_ && fsr_bilinear_pipeline_ && fsr_rcas_pipeline_;
+}
+
+bool PlumeRenderer::EnsureFsrImage(uint32_t width, uint32_t height) {
+  if (fsr_image_.texture && fsr_image_.width == width && fsr_image_.height == height) {
+    return true;
+  }
+  if (fsr_framebuffer_) {
+    Retire(std::move(fsr_framebuffer_));
+  }
+  if (fsr_image_.texture) {
+    Retire(std::move(fsr_image_.texture));
+  }
+  fsr_image_ = TrackedTexture();
+  fsr_image_.format = kFsrImageFormat;
+  fsr_image_.width = width;
+  fsr_image_.height = height;
+  fsr_image_.texture = device_->createTexture(plume::RenderTextureDesc::ColorTarget(width, height, kFsrImageFormat));
+  if (!fsr_image_.texture) {
+    return false;
+  }
+  fsr_image_.texture->setName("FSR");
+  const plume::RenderTexture* color = fsr_image_.texture.get();
+  plume::RenderFramebufferDesc desc;
+  desc.colorAttachments = &color;
+  desc.colorAttachmentsCount = 1;
+  fsr_framebuffer_ = device_->createFramebuffer(desc);
+  return fsr_framebuffer_ != nullptr;
 }
 
 void PlumeRenderer::DestroySwapChain() {
@@ -562,21 +714,57 @@ bool PlumeRenderer::EndFrame(TrackedTexture* source, uint32_t width, uint32_t he
     if (source) {
       source->Transition(list, plume::RenderTextureLayout::SHADER_READ);
     }
-    list->setFramebuffer(framebuffers_[image].get());
     uint32_t target_width = swap_chain_->getWidth(), target_height = swap_chain_->getHeight();
+    // Letterboxed to the aspect ratio of the source, or stretched.
+    float view_width = float(target_width), view_height = float(target_height);
+    if (source && width && height && REXCVAR_GET(plume_letterbox)) {
+      float scale = std::min(float(target_width) / float(width), float(target_height) / float(height));
+      view_width = float(width) * scale;
+      view_height = float(height) * scale;
+    }
+    float view_x = (float(target_width) - view_width) * 0.5f;
+    float view_y = (float(target_height) - view_height) * 0.5f;
+    // FSR: the first pass to the intermediate image, the second (RCAS) below.
+    std::string effect = REXCVAR_GET(plume_present_effect);
+    uint32_t fsr_width = uint32_t(view_width + 0.5f), fsr_height = uint32_t(view_height + 0.5f);
+    bool fsr = source && width && height && effect != "bilinear" && fsr_rcas_pipeline_ && fsr_width &&
+               fsr_height && EnsureFsrImage(fsr_width, fsr_height);
+    float fsr_constants[12] = {float(width), float(height), 0.0f, 0.0f,
+                               float(fsr_width), float(fsr_height), std::floor(view_x), std::floor(view_y),
+                               swap_red_blue ? 1.0f : 0.0f, float(REXCVAR_GET(plume_fsr_sharpness)), 0.0f, 0.0f};
+    if (fsr) {
+      fsr_constants[2] = float(source->width);
+      fsr_constants[3] = float(source->height);
+      // EASU only upscales: bilinear when the output is not larger.
+      bool upscale = effect == "fsr" && (fsr_width > width || fsr_height > height);
+      fsr_image_.Transition(list, plume::RenderTextureLayout::COLOR_WRITE);
+      list->setFramebuffer(fsr_framebuffer_.get());
+      list->setViewports(plume::RenderViewport(0.0f, 0.0f, float(fsr_width), float(fsr_height)));
+      list->setScissors(plume::RenderRect(0, 0, int32_t(fsr_width), int32_t(fsr_height)));
+      plume::RenderDescriptorSet* set = fsr_input_sets_[frame_slot_].get();
+      set->setTexture(0, source->texture.get(), plume::RenderTextureLayout::SHADER_READ);
+      list->setPipeline(upscale ? fsr_easu_pipeline_.get() : fsr_bilinear_pipeline_.get());
+      list->setGraphicsPipelineLayout(fsr_layout_.get());
+      list->setGraphicsDescriptorSet(set, 0);
+      list->setGraphicsPushConstants(0, fsr_constants);
+      list->drawInstanced(3, 1, 0, 0);
+      fsr_image_.Transition(list, plume::RenderTextureLayout::SHADER_READ);
+    }
+    list->setFramebuffer(framebuffers_[image].get());
     list->setScissors(plume::RenderRect(0, 0, int32_t(target_width), int32_t(target_height)));
     list->clearColor(0, plume::RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
-    if (source && width && height) {
-      // Letterboxed to the aspect ratio of the source, or stretched.
-      float scale = std::min(float(target_width) / float(width), float(target_height) / float(height));
-      float view_width = float(width) * scale, view_height = float(height) * scale;
-      if (!REXCVAR_GET(plume_letterbox)) {
-        view_width = float(target_width);
-        view_height = float(target_height);
-      }
-      list->setViewports(plume::RenderViewport((float(target_width) - view_width) * 0.5f,
-                                               (float(target_height) - view_height) * 0.5f,
-                                               view_width, view_height));
+    if (fsr) {
+      list->setViewports(plume::RenderViewport(std::floor(view_x), std::floor(view_y), float(fsr_width),
+                                               float(fsr_height)));
+      plume::RenderDescriptorSet* set = fsr_rcas_sets_[frame_slot_].get();
+      set->setTexture(0, fsr_image_.texture.get(), plume::RenderTextureLayout::SHADER_READ);
+      list->setPipeline(fsr_rcas_pipeline_.get());
+      list->setGraphicsPipelineLayout(fsr_layout_.get());
+      list->setGraphicsDescriptorSet(set, 0);
+      list->setGraphicsPushConstants(0, fsr_constants);
+      list->drawInstanced(3, 1, 0, 0);
+    } else if (source && width && height) {
+      list->setViewports(plume::RenderViewport(view_x, view_y, view_width, view_height));
       plume::RenderDescriptorSet* set = present_sets_[frame_slot_].get();
       set->setTexture(0, source->texture.get(), plume::RenderTextureLayout::SHADER_READ);
       list->setPipeline(present_pipeline_.get());

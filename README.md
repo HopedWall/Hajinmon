@@ -129,7 +129,8 @@ tools\setup_plume.cmd
 This clones [Plume](https://github.com/renderbag/plume) (the graphics library
 of the native renderer) into `external\plume` and the
 [DXC binaries](https://github.com/renderbag/dxc-bin) (the shader compiler) into
-`external\dxc-bin`, at pinned commits (`tools/setup_plume.sh` on Linux). To
+`external\dxc-bin` and [FidelityFX FSR](https://github.com/GPUOpen-Effects/FidelityFX-FSR)
+(the upscaler) into `external\FidelityFX-FSR`, at pinned commits (`tools/setup_plume.sh` on Linux). To
 build without the native renderer,
 configure the game with `-DHAJINMON_PLUME_RENDERER=OFF` instead.
 
@@ -191,7 +192,7 @@ settings (shown in the *Advanced* tab). Settings are stored in
   (anisotropic up to 16x), anti-aliasing (FXAA; MSAA with Plume), scaling filter
   (bilinear, AMD CAS sharpening or AMD FSR upscaling), VSync, 16:9
   letterboxing, the graphics API (Direct3D 12 or Vulkan) and the GPU to use.
-  With Plume, FXAA, CAS/FSR and the GPU choice are not available; *Precompile
+  With Plume, FXAA and the GPU choice are not available; *Precompile
   shaders* compiles the shaders it knows in advance (useful on slower devices),
   and *Clear shader cache* deletes the compiled ones.
 - **Game**: language (English, Japanese, German, French, Spanish, Italian),
@@ -310,6 +311,8 @@ only.
 | `--plume_anisotropic=N` | Texture filtering: `-1` game default, `0` off, `2`-`5` = 2x/4x/8x/16x. |
 | `--no-plume_vsync` | Present without waiting for the vertical blank (tearing). |
 | `--no-plume_letterbox` | Stretch the image instead of keeping 16:9. |
+| `--plume_present_effect=fsr` | Scaling to the window: `bilinear` (default), `cas` (sharpened) or `fsr` (AMD FidelityFX FSR 1 upscaling and sharpening, best with `--plume_resolution_scale=1`). |
+| `--plume_fsr_sharpness=0.2` | Sharpening of `cas` and `fsr`, in stops: 0 is the sharpest, 2 the softest. |
 | `--plume_async_shaders` | Skip draws whose shaders are still compiling instead of waiting for them. |
 | `--plume_precompile_shaders` | Compile the executable's shaders and those seen in earlier sessions with every core, then exit (the launcher's *Precompile shaders*). |
 
@@ -417,8 +420,9 @@ background at startup, so new scenes don't stall after the first time.
 - [XenonRecomp](https://github.com/hedge-dev/XenonRecomp), which pioneered
   Xbox 360 static recompilation.
 - [Plume](https://github.com/renderbag/plume), the graphics library of the
-  native renderer, and [DXC](https://github.com/microsoft/DirectXShaderCompiler),
-  its shader compiler.
+  native renderer, [DXC](https://github.com/microsoft/DirectXShaderCompiler),
+  its shader compiler, and [AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR),
+  its upscaler.
 
 ## License
 

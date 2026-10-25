@@ -62,6 +62,7 @@ python3 "$ROOT/tools/third_party_notices.py" "$SDK_SRC" \
 if [ -f "$BUILD/libdxcompiler.so" ]; then
     cp "$ROOT/external/plume/LICENSE" "$APPDIR/usr/share/doc/hajinmon/LICENSE-plume"
     cp "$ROOT/renderer/LICENSE-dxc.txt" "$APPDIR/usr/share/doc/hajinmon/LICENSE-dxc"
+    cp "$ROOT/external/FidelityFX-FSR/license.txt" "$APPDIR/usr/share/doc/hajinmon/LICENSE-fidelityfx-fsr"
 fi
 
 echo "[2/4] Writing the launcher script..."
