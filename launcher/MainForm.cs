@@ -114,6 +114,7 @@ public sealed class MainForm : Form
     // Cheats
     private readonly CheckBox _unlockCharacters = new() { Text = "Unlock all characters", AutoSize = true };
     private readonly CheckBox _unlockCostumes = new() { Text = "Unlock all costumes", AutoSize = true };
+    private readonly CheckBox _playAlpha152 = new() { Text = "Play as Alpha-152 (experimental)", AutoSize = true };
     private readonly CheckBox _backupSave = new() { Text = "Back up the save data before launching with cheats", AutoSize = true };
 
     // Advanced
@@ -427,6 +428,10 @@ public sealed class MainForm : Form
         AddRow(grid, null, Note("Makes every character selectable, including the hidden ones."));
         AddRow(grid, null, _unlockCostumes);
         AddRow(grid, null, Note("Unlocks every costume of every character."));
+        AddRow(grid, null, _playAlpha152);
+        AddRow(grid, null, Note(
+            "The final boss becomes playable: on the character select screen, the random " +
+            "choice (the dice) picks Alpha-152. Best in Versus and Training."));
         AddRow(grid, null, _backupSave);
         AddRow(grid, null, Note(
             "Cheats are applied once the profile has been loaded (after PRESS START). The game " +
@@ -515,6 +520,7 @@ public sealed class MainForm : Form
 
         _unlockCharacters.Checked = s.UnlockAllCharacters;
         _unlockCostumes.Checked = s.UnlockAllCostumes;
+        _playAlpha152.Checked = s.PlayAlpha152;
         _backupSave.Checked = s.BackupSaveBeforeCheats;
 
         _extraArgs.Text = s.ExtraArguments;
@@ -545,6 +551,7 @@ public sealed class MainForm : Form
 
         s.UnlockAllCharacters = _unlockCharacters.Checked;
         s.UnlockAllCostumes = _unlockCostumes.Checked;
+        s.PlayAlpha152 = _playAlpha152.Checked;
         s.BackupSaveBeforeCheats = _backupSave.Checked;
 
         s.ExtraArguments = _extraArgs.Text.Trim();
@@ -732,6 +739,7 @@ public sealed class MainForm : Form
 
         if (s.UnlockAllCharacters) args.Add("--cheat_unlock_characters");
         if (s.UnlockAllCostumes) args.Add("--cheat_unlock_costumes");
+        if (s.PlayAlpha152) args.Add("--cheat_play_alpha152");
 
         if (!string.IsNullOrWhiteSpace(s.ExtraArguments)) args.Add(s.ExtraArguments);
     }
@@ -743,7 +751,8 @@ public sealed class MainForm : Form
         string? exe = PrepareGame();
         if (exe == null) return;
 
-        if ((_settings.UnlockAllCharacters || _settings.UnlockAllCostumes) && _settings.BackupSaveBeforeCheats)
+        if ((_settings.UnlockAllCharacters || _settings.UnlockAllCostumes || _settings.PlayAlpha152) &&
+            _settings.BackupSaveBeforeCheats)
         {
             try
             {

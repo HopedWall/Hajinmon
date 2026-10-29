@@ -48,6 +48,7 @@ public sealed class Settings
     // Cheats
     public bool UnlockAllCharacters { get; set; } = false;
     public bool UnlockAllCostumes { get; set; } = false;
+    public bool PlayAlpha152 { get; set; } = false;
     public bool BackupSaveBeforeCheats { get; set; } = true;
 
     // Advanced

@@ -221,8 +221,12 @@ the launcher therefore copies the save folder (without the shader cache) into
 enabled. To undo the unlocks, close the game and copy a backup back into the
 save folder.
 
+**Play as Alpha-152** (experimental) makes the final boss playable: on the
+character select screen, the random choice (the dice) picks Alpha-152 instead.
+It works in Versus and Training; other modes are untested.
+
 The cheats are also available as game options:
-`--cheat_unlock_characters` and `--cheat_unlock_costumes`.
+`--cheat_unlock_characters`, `--cheat_unlock_costumes` and `--cheat_play_alpha152`.
 
 ## Controls
 
