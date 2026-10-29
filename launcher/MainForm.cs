@@ -431,7 +431,7 @@ public sealed class MainForm : Form
         AddRow(grid, null, _playAlpha152);
         AddRow(grid, null, Note(
             "The final boss becomes playable: on the character select screen, the random " +
-            "choice (the dice) picks Alpha-152. Best in Versus and Training."));
+            "choice (the dice) picks Alpha-152. Tested in Versus, Tag and Training."));
         AddRow(grid, null, _backupSave);
         AddRow(grid, null, Note(
             "Cheats are applied once the profile has been loaded (after PRESS START). The game " +
