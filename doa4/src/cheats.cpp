@@ -39,6 +39,9 @@ REXCVAR_DEFINE_BOOL(cheat_unlock_characters, false, "Cheats",
                     "Unlock every playable character");
 REXCVAR_DEFINE_BOOL(cheat_unlock_costumes, false, "Cheats",
                     "Unlock every costume of every playable character");
+REXCVAR_DEFINE_BOOL(cheat_unlock_announcer_voices, false, "Cheats",
+                    "Unlock every character's voice for the menu announcer, and mark Story mode "
+                    "cleared, so that with all the costumes the Tatami stage is unlocked too");
 REXCVAR_DEFINE_BOOL(cheat_play_alpha152, false, "Cheats",
                     "Experimental: the random choice of the character select screen picks Alpha-152");
 
@@ -55,6 +58,17 @@ constexpr uint32_t kProgressPointer = 0x83022320;
 constexpr uint32_t kProgressOffset = 0x7968;
 constexpr uint32_t kCostumeCounts = 0x3FC2;
 constexpr uint32_t kCharacterUnlocked = 0x3FD9;
+// The per-slot table of the characters' voices for the menu announcer
+// (unlocked in game by clearing Training mode with the character).
+constexpr uint32_t kAnnouncerVoices = 0x4035;
+constexpr uint32_t kStoryCleared = 0x3FF0;
+// The Tatami stage is available when sub_82523698 is true: every costume
+// (but Alpha-152's), Story mode cleared with every character of the Story
+// list, and every announcer voice (but slot 3).
+constexpr uint32_t kSlotToIdTable = 0x82C4A054;
+constexpr uint32_t kStoryList = 0x82C243C8;
+constexpr uint32_t kStoryListEntrySize = 40;
+constexpr uint32_t kStoryListCount = 18;
 constexpr uint32_t kSlotCount = 23;
 constexpr uint32_t kIdToSlotTable = 0x82C4A038;
 constexpr uint32_t kMaxCostumesTable = 0x82C24850;
@@ -103,8 +117,27 @@ int ApplyAlpha152(uint32_t progress) {
 }
 
 // Applies the enabled cheats; returns the number of bytes changed.
-int Apply(uint32_t progress, bool characters, bool costumes) {
+int Apply(uint32_t progress, bool characters, bool costumes, bool voices) {
   int changed = 0;
+  // Every slot, Alpha-152's included: the check that unlocks the Tatami stage
+  // (sub_82523698) wants all of them but slot 3.
+  for (uint32_t slot = 0; voices && slot < kSlotCount; ++slot) {
+    uint8_t* voice = Guest(progress + kAnnouncerVoices + slot);
+    if (*voice == 0) {
+      *voice = 1;
+      ++changed;
+    }
+    uint8_t id = *Guest(kSlotToIdTable + slot);
+    for (uint32_t i = 0; i < kStoryListCount; ++i) {
+      if (*Guest(kStoryList + i * kStoryListEntrySize) != id) continue;
+      uint8_t* cleared = Guest(progress + kStoryCleared + slot);
+      if (*cleared == 0) {
+        *cleared = 1;
+        ++changed;
+      }
+      break;
+    }
+  }
   for (uint8_t id : kPlayableIds) {
     uint8_t slot = *Guest(kIdToSlotTable + id);
     if (slot >= kSlotCount) continue;
@@ -127,7 +160,7 @@ int Apply(uint32_t progress, bool characters, bool costumes) {
   return changed;
 }
 
-void CheatLoop(bool characters, bool costumes, bool alpha152) {
+void CheatLoop(bool characters, bool costumes, bool voices, bool alpha152) {
   bool reported = false;
   while (true) {
     std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -136,7 +169,7 @@ void CheatLoop(bool characters, bool costumes, bool alpha152) {
     bool loaded = progress == kSaveBuffer + kProgressOffset;
     int changed = alpha152 ? ApplyAlpha152(loaded ? progress : 0) : 0;
     if (!loaded) continue;
-    changed += Apply(progress, characters, costumes);
+    changed += Apply(progress, characters, costumes, voices);
     if (changed && !reported) {
       reported = true;
       REXLOG_INFO("doa4: cheats applied to the loaded profile ({} values changed)", changed);
@@ -149,11 +182,13 @@ void CheatLoop(bool characters, bool costumes, bool alpha152) {
 void StartCheats() {
   bool characters = REXCVAR_GET(cheat_unlock_characters);
   bool costumes = REXCVAR_GET(cheat_unlock_costumes);
+  bool voices = REXCVAR_GET(cheat_unlock_announcer_voices);
   bool alpha152 = REXCVAR_GET(cheat_play_alpha152);
-  if (!characters && !costumes && !alpha152) return;
-  REXLOG_INFO("doa4: cheats enabled:{}{}{}", characters ? " all characters" : "",
-              costumes ? " all costumes" : "", alpha152 ? " Alpha-152" : "");
-  std::thread(CheatLoop, characters, costumes, alpha152).detach();
+  if (!characters && !costumes && !voices && !alpha152) return;
+  REXLOG_INFO("doa4: cheats enabled:{}{}{}{}", characters ? " all characters" : "",
+              costumes ? " all costumes" : "", voices ? " announcer voices" : "",
+              alpha152 ? " Alpha-152" : "");
+  std::thread(CheatLoop, characters, costumes, voices, alpha152).detach();
 }
 
 }  // namespace doa4

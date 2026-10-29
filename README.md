@@ -221,12 +221,18 @@ the launcher therefore copies the save folder (without the shader cache) into
 enabled. To undo the unlocks, close the game and copy a backup back into the
 save folder.
 
+**Unlock all announcer voices** gives every character's voice for the menu
+announcer (normally earned by clearing Training mode with the character). It
+also marks Story mode cleared for the Story characters: together with *Unlock
+all costumes* this unlocks the Tatami stage, which needs all three.
+
 **Play as Alpha-152** (experimental) makes the final boss playable: on the
 character select screen, the random choice (the dice) picks Alpha-152 instead.
 It works in Versus, Tag and Training; other modes are untested.
 
 The cheats are also available as game options:
-`--cheat_unlock_characters`, `--cheat_unlock_costumes` and `--cheat_play_alpha152`.
+`--cheat_unlock_characters`, `--cheat_unlock_costumes`, `--cheat_unlock_announcer_voices`
+and `--cheat_play_alpha152`.
 
 ## Controls
 
