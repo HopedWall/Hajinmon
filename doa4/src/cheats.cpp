@@ -16,7 +16,8 @@
 //   (0x82F4B5F0, 40-byte entries starting with the ID): 0-15, 17-21 and 24.
 //
 // - Alpha-152, the final boss, is character ID 16: it is not in the grid, but
-//   it has a profile slot (21) and 2 costumes in the tables above. The last
+//   it has a profile slot (21) and 2 costumes in the tables above (the same
+//   model twice, so only 1 is unlocked). The last
 //   grid entry (22) is the random choice, ID 0xFF.
 //
 // A background thread waits until a profile is loaded and then keeps these
@@ -89,10 +90,11 @@ int ApplyAlpha152(uint32_t progress) {
         *unlocked = 1;
         ++changed;
       }
-      uint8_t max = *Guest(kMaxCostumesTable + kAlpha152);
+      // One costume: the table says 2, but the second is a copy of the
+      // first (alp01 twice in chrthree.afs).
       uint8_t* count = Guest(progress + kCostumeCounts + slot);
-      if (max && *count < max) {
-        *count = max;
+      if (*count != 1) {
+        *count = 1;
         ++changed;
       }
     }
