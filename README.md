@@ -13,6 +13,32 @@ runtime.
 > Neither this repository nor the releases contain any **game data**. You need
 > your own copy of the game (an ISO dumped from the original Xbox 360 disc).
 
+## FAQs
+
+**Is this project AI-assisted?**
+
+Yes, Claude Code was used extensively in the development of this project. I am a professional software developer myself but have not experience in either reverse engineering or game dev in general, so without Claude this wouldn't have been possible. I would have enjoyed writing this myself but it would have taken ages and most probably would never have existed.
+
+**Does this project use ReXGlue?**
+
+Yes, it does. It's a great project and the backbone of many recent ports.
+
+**Is this an official port?**
+
+Absolutely not, this a fan project coming from a long time DoA fan. This is 100% free and I do not accept donations. All it costed me was a few afternoons and a Claude Pro subscription. This is NOT endorsed or associated with Koei Tecmo.
+
+**Why this game?**
+
+I have been in love with the DoA series ever since the first Xbox launch. While DoA3 and DoA2U are somewhat playable using emulators, this has not been the case with DoA4. In my experience, this plays much better than the emulated version in terms of performance and accuracy.
+
+**Does it support multiplayer?**
+
+As of now, no. But please feel free to submit a PR if you are interested in adding this feature.
+
+**I heard this recomp supports cheats...**
+
+It's mostly time savers for unlocking costumes and characters. Also you can play as Alpha-152 :)
+
 ## Status
 
 - Boots, plays the intro videos, title screen, menus and fights.
