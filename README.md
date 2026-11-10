@@ -437,7 +437,10 @@ background at startup, so new scenes don't stall after the first time.
      the game follows it;
    - `--padbind_*` options remap the buttons of physical controllers;
    - `--game_data_root` also accepts a disc image (`.iso`), read in place;
-   - `--log_guest_fps` logs the guest frame rate.
+   - `--log_guest_fps` logs the guest frame rate;
+   - `recvfrom` on a datagram socket that was never bound fails with
+     `WSAEINVAL` like on Windows instead of blocking forever (froze the game on
+     a black screen at startup on Linux and under Wine/Proton).
 
 4. The native renderer (`renderer/`) keeps the SDK's GPU front end (registers,
    command stream, interrupts, shader microcode analysis) and replaces the
