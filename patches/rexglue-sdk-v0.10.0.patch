@@ -928,6 +928,46 @@ index c10694c..9e837c8 100644
      return false;
    }
    if (!file_system_->RegisterDevice(std::move(device))) {
+diff --git a/src/system/xsocket.cpp b/src/system/xsocket.cpp
+index 2d13ac8..f3ddf1e 100644
+--- a/src/system/xsocket.cpp
++++ b/src/system/xsocket.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <cerrno>
+ #include <cstring>
+ 
+ #include <rex/kernel/xam/module.h>
+@@ -186,6 +187,27 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
+   }
+   */
+ 
++  // A datagram socket that was never bound (explicitly or by a send) has no
++  // local port. Windows and the Xbox 360 fail recvfrom on it with WSAEINVAL;
++  // POSIX, and Wine on top of it, block until a packet arrives, which never
++  // happens. Dead or Alive 4 reads such a socket on its main thread at startup,
++  // which froze the game on a black screen on Linux and under Wine/Proton.
++  if (type_ == X_SOCK_DGRAM) {
++    sockaddr_in local = {};
++    socklen_t local_len = sizeof(local);
++    if (getsockname(native_handle_, reinterpret_cast<sockaddr*>(&local), &local_len) != 0) {
++      return -1;  // Unbound on Windows: the last error is already WSAEINVAL.
++    }
++    if (local.sin_port == 0) {
++#if REX_PLATFORM_WIN32
++      WSASetLastError(WSAEINVAL);
++#else
++      errno = EINVAL;
++#endif
++      return -1;
++    }
++  }
++
+   sockaddr_in nfrom;
+   socklen_t nfromlen = sizeof(sockaddr_in);
+   int ret = recvfrom(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
 diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
 index 77bce25..c22ab12 100644
 --- a/src/system/xthread.cpp
